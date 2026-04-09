@@ -109,6 +109,20 @@ func (p *Pool) Fill(vcpus, memMiB int) error {
 	return nil
 }
 
+// GetActive returns an active VM by ID, or nil if not found.
+func (p *Pool) GetActive(vmID string) *vm.VM {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.active[vmID]
+}
+
+// TrackActive adds a VM to the active set (used for branch VMs).
+func (p *Pool) TrackActive(v *vm.VM) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.active[v.ID] = v
+}
+
 // Status returns pool stats.
 func (p *Pool) Status() (warm, active, max int) {
 	p.mu.Lock()

@@ -100,14 +100,49 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]interface{}{"released": vmID})
 	})
 
-	mux.HandleFunc("/snapshot", func(w http.ResponseWriter, r *http.Request) {
-		// TODO: implement snapshot endpoint
-		http.Error(w, "not implemented", http.StatusNotImplemented)
-	})
+	mux.HandleFunc("/branch", func(w http.ResponseWriter, r *http.Request) {
+		vmID := r.URL.Query().Get("vm_id")
+		countStr := r.URL.Query().Get("count")
+		if vmID == "" {
+			http.Error(w, "vm_id required", http.StatusBadRequest)
+			return
+		}
+		count := 3
+		if countStr != "" {
+			fmt.Sscanf(countStr, "%d", &count)
+		}
 
-	mux.HandleFunc("/restore", func(w http.ResponseWriter, r *http.Request) {
-		// TODO: implement restore endpoint
-		http.Error(w, "not implemented", http.StatusNotImplemented)
+		sourceVM := p.GetActive(vmID)
+		if sourceVM == nil {
+			http.Error(w, "VM not found", http.StatusNotFound)
+			return
+		}
+
+		snapshotDir := fmt.Sprintf("%s/snapshots/%s", workDir, vmID)
+		start := time.Now()
+		branches, err := vm.Branch(cfg, sourceVM, snapshotDir, count)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		elapsed := time.Since(start)
+		result := map[string]interface{}{
+			"source_vm_id":    vmID,
+			"branch_count":    len(branches),
+			"total_time_ms":   elapsed.Milliseconds(),
+			"branches":        []map[string]interface{}{},
+		}
+		branchList := make([]map[string]interface{}, len(branches))
+		for i, b := range branches {
+			p.TrackActive(b)
+			branchList[i] = map[string]interface{}{
+				"vm_id": b.ID,
+				"pid":   b.PID,
+			}
+		}
+		result["branches"] = branchList
+		json.NewEncoder(w).Encode(result)
 	})
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
