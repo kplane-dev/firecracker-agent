@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: firecracker-agent
+  namespace: kplane-sandbox-system
+  labels:
+    app: firecracker-agent
+spec:
+  selector:
+    matchLabels:
+      app: firecracker-agent
+  template:
+    metadata:
+      labels:
+        app: firecracker-agent
+    spec:
+      nodeSelector:
+        kplane.dev/sandbox-runtime: firecracker
+      tolerations:
+      - key: kplane.dev/sandbox-runtime
+        operator: Equal
+        value: firecracker
+        effect: NoSchedule
+      hostPID: true
+      containers:
+      - name: agent
+        image: ghcr.io/kplane-dev/firecracker-agent:latest
+        args:
+        - --listen=:8090
+        - --firecracker-bin=/host/opt/kata/bin/firecracker
+        - --kernel=/host/opt/kata/share/kata-containers/vmlinux-6.18.15-186
+        - --rootfs=/host/opt/kata/share/kata-containers/kata-alpine-3.22.initrd
+        - --work-dir=/host/var/lib/firecracker-agent
+        - --max-vms=10
+        - --min-warm=3
+        ports:
+        - name: api
+          containerPort: 8090
+        - name: health
+          containerPort: 8090
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: host
+          mountPath: /host
+        - name: dev-kvm
+          mountPath: /dev/kvm
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8090
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8090
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+      volumes:
+      - name: host
+        hostPath:
+          path: /
+      - name: dev-kvm
+        hostPath:
+          path: /dev/kvm

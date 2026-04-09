@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package api;
+
+option go_package = "github.com/kplane-dev/firecracker-agent/pkg/api";
+
+service SandboxAgent {
+  // Claim a VM from the warm pool (or cold boot if none available).
+  rpc Claim(ClaimRequest) returns (ClaimResponse);
+
+  // Release a VM back (destroy it).
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+
+  // Snapshot a running VM's state.
+  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+
+  // Restore a VM from a snapshot (used for branching).
+  rpc Restore(RestoreRequest) returns (RestoreResponse);
+
+  // Status returns the agent's current capacity and warm pool state.
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+message ClaimRequest {
+  // image is the container/rootfs image to use.
+  string image = 1;
+  // cpu is the number of vCPUs.
+  int32 cpu = 2;
+  // memory_mib is the memory in MiB.
+  int32 memory_mib = 3;
+}
+
+message ClaimResponse {
+  string vm_id = 1;
+  string ip = 2;
+  int64 boot_time_ms = 3;
+  bool from_warm_pool = 4;
+}
+
+message ReleaseRequest {
+  string vm_id = 1;
+}
+
+message ReleaseResponse {}
+
+message SnapshotRequest {
+  string vm_id = 1;
+  string snapshot_id = 2;
+}
+
+message SnapshotResponse {
+  string snapshot_id = 1;
+  int64 snapshot_time_ms = 2;
+}
+
+message RestoreRequest {
+  string snapshot_id = 1;
+  // new_vm_id is the ID for the restored VM. If empty, a new ID is generated.
+  string new_vm_id = 2;
+}
+
+message RestoreResponse {
+  string vm_id = 1;
+  string ip = 2;
+  int64 restore_time_ms = 3;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  int32 warm_count = 1;
+  int32 active_count = 2;
+  int32 max_vms = 3;
+  repeated string warm_images = 4;
+}
