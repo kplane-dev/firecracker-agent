@@ -94,10 +94,11 @@ func Boot(cfg Config, id string, vcpus int, memMiB int) (*VM, error) {
 		return nil, fmt.Errorf("set boot source: %w", err)
 	}
 
-	// Configure machine
+	// Configure machine with dirty page tracking for diff snapshots
 	if err := vm.apiPut("/machine-config", map[string]interface{}{
-		"vcpu_count":  vcpus,
-		"mem_size_mib": memMiB,
+		"vcpu_count":       vcpus,
+		"mem_size_mib":     memMiB,
+		"track_dirty_pages": true,
 	}); err != nil {
 		cmd.Process.Kill()
 		return nil, fmt.Errorf("set machine config: %w", err)
@@ -130,7 +131,9 @@ func (vm *VM) Destroy() error {
 }
 
 // Snapshot pauses the VM and saves its state.
-func (vm *VM) Snapshot(snapshotDir string) error {
+// If diff is true, only dirty pages since last snapshot are saved (~15ms).
+// If diff is false, a full snapshot is taken (~150ms).
+func (vm *VM) Snapshot(snapshotDir string, diff bool) error {
 	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
 		return fmt.Errorf("create snapshot dir: %w", err)
 	}
@@ -142,17 +145,29 @@ func (vm *VM) Snapshot(snapshotDir string) error {
 		return fmt.Errorf("pause: %w", err)
 	}
 
+	snapshotType := "Full"
+	if diff {
+		snapshotType = "Diff"
+	}
+
 	// Create snapshot
 	if err := vm.apiPut("/snapshot/create", map[string]interface{}{
-		"snapshot_type": "Full",
+		"snapshot_type": snapshotType,
 		"snapshot_path": filepath.Join(snapshotDir, "vmstate"),
 		"mem_file_path": filepath.Join(snapshotDir, "mem"),
 	}); err != nil {
 		return fmt.Errorf("create snapshot: %w", err)
 	}
 
-	klog.Infof("vm %s snapshot saved to %s", vm.ID, snapshotDir)
+	klog.Infof("vm %s %s snapshot saved to %s", vm.ID, snapshotType, snapshotDir)
 	return nil
+}
+
+// Resume unpauses the VM after a snapshot.
+func (vm *VM) Resume() error {
+	return vm.apiPatch("/vm", map[string]interface{}{
+		"state": "Resumed",
+	})
 }
 
 // Restore boots a new VM from a snapshot.
@@ -261,14 +276,24 @@ func ReflinkCopy(src, dst string) error {
 
 // Branch snapshots the source VM and restores N copies from the snapshot.
 // Uses reflink copies when the filesystem supports it (btrfs/XFS).
+// Branch snapshots the source VM using a diff snapshot and restores N copies.
+// The source VM is resumed after the snapshot is taken.
+// Uses reflink copies when the filesystem supports it (btrfs/XFS).
 func Branch(cfg Config, source *VM, snapshotDir string, count int) ([]*VM, error) {
-	// Snapshot the source
+	// Diff snapshot the source (~15ms vs ~150ms for full)
 	start := time.Now()
-	if err := source.Snapshot(snapshotDir); err != nil {
+	if err := source.Snapshot(snapshotDir, true); err != nil {
 		return nil, fmt.Errorf("snapshot source: %w", err)
 	}
 	snapDuration := time.Since(start)
-	klog.Infof("branch: snapshot took %v", snapDuration)
+
+	// Resume the source VM immediately — it only needs to be paused
+	// for the duration of the diff snapshot (~15ms).
+	if err := source.Resume(); err != nil {
+		klog.Warningf("branch: failed to resume source VM %s: %v", source.ID, err)
+	}
+
+	klog.Infof("branch: diff snapshot took %v, source resumed", snapDuration)
 
 	// Restore N copies
 	var branches []*VM
