@@ -179,10 +179,19 @@ func (vm *VM) WaitReady(timeout time.Duration) error {
 }
 
 // Exec runs a command inside the VM via the vsock guest agent.
+// Retries the vsock connect briefly to handle post-restore transport resets.
 func (vm *VM) Exec(cmd []string, timeout time.Duration) (stdout, stderr string, exitCode int, err error) {
-	conn, err := vsockConnect(vm.VsockPath, 1024)
-	if err != nil {
-		return "", "", -1, fmt.Errorf("vsock connect: %w", err)
+	var conn net.Conn
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		conn, err = vsockConnect(vm.VsockPath, 1024)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			return "", "", -1, fmt.Errorf("vsock connect: %w", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if timeout > 0 {
 		conn.SetDeadline(time.Now().Add(timeout))
