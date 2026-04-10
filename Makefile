@@ -20,7 +20,7 @@ download-firecracker:
 
 download-kernel:
 	mkdir -p out/bin
-	curl -fSL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$(FC_VERSION)/$(FC_ARCH)/vmlinux-5.10.233" \
+	curl -fSL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/$(FC_ARCH)/vmlinux-5.10.233" \
 		-o out/bin/vmlinux
 	@echo "-> out/bin/vmlinux"
 
