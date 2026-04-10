@@ -57,9 +57,9 @@ func (p *Pool) Claim(image string, vcpus, memMiB int) (*vm.VM, bool, error) {
 		return v, true, nil
 	}
 
-	// Cold boot (with vsock since it won't be snapshotted)
+	// Cold boot
 	id := p.nextVMID()
-	v, err := vm.Boot(p.cfg, id, image, vcpus, memMiB, true)
+	v, err := vm.Boot(p.cfg, id, image, vcpus, memMiB)
 	if err != nil {
 		return nil, false, err
 	}

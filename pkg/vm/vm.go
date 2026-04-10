@@ -53,9 +53,7 @@ type VM struct {
 }
 
 // Boot starts a new Firecracker VM and returns it.
-// If withVsock is true, a vsock device is configured for guest agent communication.
-// VMs destined for the warm pool should boot without vsock (it breaks snapshot restore).
-func Boot(cfg Config, id string, image string, vcpus int, memMiB int, withVsock ...bool) (*VM, error) {
+func Boot(cfg Config, id string, image string, vcpus int, memMiB int) (*VM, error) {
 	socketDir := filepath.Join(cfg.WorkDir, id)
 	if err := os.MkdirAll(socketDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create socket dir: %w", err)
@@ -118,18 +116,6 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int, withVsock 
 	}); err != nil {
 		cmd.Process.Kill()
 		return nil, fmt.Errorf("set machine config: %w", err)
-	}
-
-	// Configure vsock for guest agent communication (skip for warm pool VMs
-	// since vsock UDS paths break snapshot restore).
-	if len(withVsock) > 0 && withVsock[0] {
-		if err := vm.apiPut("/vsock", map[string]interface{}{
-			"guest_cid": 3,
-			"uds_path":  vsockPath,
-		}); err != nil {
-			cmd.Process.Kill()
-			return nil, fmt.Errorf("set vsock: %w", err)
-		}
 	}
 
 	// Start the VM
