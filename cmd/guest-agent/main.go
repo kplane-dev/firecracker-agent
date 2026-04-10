@@ -37,14 +37,14 @@ func main() {
 	fmt.Fprintf(os.Stderr, "guest-agent: listening on vsock port %d\n", agentPort)
 
 	for {
-		connFd, _, err := syscall.Accept(listenFd)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "guest-agent: accept: %v\n", err)
+		// Use raw accept syscall — Go's syscall.Accept doesn't support AF_VSOCK sockaddr
+		connFd, _, errno := syscall.Syscall(syscall.SYS_ACCEPT, uintptr(listenFd), 0, 0)
+		if errno != 0 {
+			fmt.Fprintf(os.Stderr, "guest-agent: accept: %v\n", errno)
 			continue
 		}
-		// Ensure blocking mode — Go's runtime may set FDs non-blocking
-		syscall.SetNonblock(connFd, false)
-		go handleConn(connFd)
+		syscall.SetNonblock(int(connFd), false)
+		go handleConn(int(connFd))
 	}
 }
 
