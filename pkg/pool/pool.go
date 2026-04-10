@@ -11,16 +11,18 @@ import (
 )
 
 // Pool manages warm and active VMs, keyed by rootfs image.
+// Warm VMs are paused at their baseline snapshot point.
+// Claiming resumes them; branching uses diff snapshots against the baseline.
 type Pool struct {
 	cfg        vm.Config
 	maxVMs     int
-	minWarm    int // per-image minimum
+	minWarm    int
 	warmVCPUs  int
 	warmMemMiB int
 	warmImages []string
 
 	mu     sync.Mutex
-	warm   map[string][]*vm.VM // image -> warm VMs
+	warm   map[string][]*vm.VM // image -> paused warm VMs
 	active map[string]*vm.VM   // vmID -> VM
 	nextID int
 }
@@ -39,7 +41,7 @@ func New(cfg vm.Config, maxVMs int, warmImages []string, minWarm, warmVCPUs, war
 	}
 }
 
-// Claim takes a VM from the warm pool (matching image) or cold boots one.
+// Claim takes a VM from the warm pool (resuming it) or cold boots one.
 func (p *Pool) Claim(image string, vcpus, memMiB int) (*vm.VM, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -48,13 +50,20 @@ func (p *Pool) Claim(image string, vcpus, memMiB int) (*vm.VM, bool, error) {
 		return nil, false, fmt.Errorf("max VMs reached (%d)", p.maxVMs)
 	}
 
-	// Try warm pool for this image
+	// Try warm pool — VMs are paused, resume on claim
 	if vms := p.warm[image]; len(vms) > 0 {
 		v := vms[len(vms)-1]
 		p.warm[image] = vms[:len(vms)-1]
-		p.active[v.ID] = v
-		klog.Infof("pool: claimed warm VM %s (image=%s, %d warm remaining)", v.ID, image, len(p.warm[image]))
-		return v, true, nil
+
+		if err := v.Resume(); err != nil {
+			klog.Errorf("pool: failed to resume warm VM %s: %v", v.ID, err)
+			v.Destroy()
+			// Fall through to cold boot
+		} else {
+			p.active[v.ID] = v
+			klog.Infof("pool: claimed warm VM %s (image=%s, %d warm remaining)", v.ID, image, len(p.warm[image]))
+			return v, true, nil
+		}
 	}
 
 	// Cold boot
@@ -82,7 +91,8 @@ func (p *Pool) Release(vmID string) error {
 	return v.Destroy()
 }
 
-// Fill pre-boots VMs to maintain the minimum warm count per image.
+// Fill pre-boots VMs, takes a baseline snapshot, and leaves them paused.
+// The baseline enables fast diff-based branching later.
 func (p *Pool) Fill() error {
 	for _, image := range p.warmImages {
 		p.mu.Lock()
@@ -108,9 +118,24 @@ func (p *Pool) Fill() error {
 				continue
 			}
 
+			// Let guest settle (init + guest-agent startup)
+			time.Sleep(2 * time.Second)
+
+			// Take baseline snapshot and leave VM paused.
+			// This resets dirty page tracking — future diff snapshots
+			// will only capture pages dirtied after resume.
+			baselineDir := fmt.Sprintf("%s/baselines/%s", p.cfg.WorkDir, v.ID)
+			if err := v.Snapshot(baselineDir, false); err != nil {
+				klog.Errorf("pool: baseline snapshot failed for %s: %v", v.ID, err)
+				v.Destroy()
+				continue
+			}
+			v.BaselineDir = baselineDir
+			// VM stays paused — resumed on Claim
+
 			p.mu.Lock()
 			p.warm[image] = append(p.warm[image], v)
-			klog.Infof("pool: pre-booted warm VM %s (image=%s) in %v (%d/%d warm)",
+			klog.Infof("pool: warm VM %s (image=%s) ready in %v (paused at baseline, %d/%d warm)",
 				v.ID, image, time.Since(start), len(p.warm[image]), p.minWarm)
 			p.mu.Unlock()
 		}

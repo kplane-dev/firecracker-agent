@@ -128,9 +128,8 @@ func main() {
 			return
 		}
 
-		snapshotDir := fmt.Sprintf("%s/snapshots/%s", workDir, vmID)
 		start := time.Now()
-		branches, err := vm.Branch(cfg, sourceVM, snapshotDir, count)
+		branches, err := vm.Branch(cfg, sourceVM, count)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

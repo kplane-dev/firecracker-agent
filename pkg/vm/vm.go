@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -27,21 +28,20 @@ type Config struct {
 	WorkDir        string
 }
 
-// ImagePath returns the full path to a rootfs image.
 func (c Config) ImagePath(image string) string {
 	return filepath.Join(c.ImageDir, image+".initrd")
 }
 
 // VM represents a running Firecracker microVM.
 type VM struct {
-	ID         string
-	Image      string
-	SocketPath string
-	VsockPath  string
-	IP         string
-	PID        int
-	StartedAt  time.Time
-	Config     Config
+	ID          string
+	Image       string
+	SocketPath  string
+	VsockPath   string
+	BaselineDir string // baseline snapshot dir (for diff-based branching)
+	PID         int
+	StartedAt   time.Time
+	Config      Config
 
 	cmd    *exec.Cmd
 	client *http.Client
@@ -58,7 +58,7 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int) (*VM, erro
 	os.Remove(filepath.Join(socketDir, "vsock.sock"))
 
 	cmd := exec.Command(cfg.FirecrackerBin, "--api-sock", socketPath)
-	cmd.Dir = socketDir // vsock UDS resolves relative to this
+	cmd.Dir = socketDir
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 
@@ -96,9 +96,6 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int) (*VM, erro
 		return nil, fmt.Errorf("set machine config: %w", err)
 	}
 
-	// Vsock with relative UDS path — resolves to <socketDir>/vsock.sock.
-	// On snapshot restore, each branch's Firecracker has its own CWD,
-	// so the relative path creates a unique UDS per branch. No collision.
 	if err := vm.apiPut("/vsock", map[string]interface{}{
 		"guest_cid": 3,
 		"uds_path":  "vsock.sock",
@@ -198,8 +195,6 @@ func (vm *VM) Exec(cmd []string, timeout time.Duration) (stdout, stderr string, 
 }
 
 // Restore boots a new VM from a snapshot.
-// vmstatePath is the path to the vmstate file (branch-specific copy).
-// memPath is the path to the memory file (can be shared across branches).
 func Restore(cfg Config, id string, image string, vmstatePath string, memPath string) (*VM, error) {
 	socketDir := filepath.Join(cfg.WorkDir, id)
 	if err := os.MkdirAll(socketDir, 0o755); err != nil {
@@ -209,7 +204,7 @@ func Restore(cfg Config, id string, image string, vmstatePath string, memPath st
 	os.Remove(socketPath)
 
 	cmd := exec.Command(cfg.FirecrackerBin, "--api-sock", socketPath)
-	cmd.Dir = socketDir // vsock "vsock.sock" resolves to <socketDir>/vsock.sock
+	cmd.Dir = socketDir
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 
@@ -250,24 +245,42 @@ func Restore(cfg Config, id string, image string, vmstatePath string, memPath st
 	return vm, nil
 }
 
-// Branch takes a full snapshot of the source VM and restores N copies in parallel.
-// The mem file is shared across all branches (Firecracker uses MAP_PRIVATE/CoW).
-// Each branch gets its own vsock UDS via relative path + unique CWD.
-func Branch(cfg Config, source *VM, snapshotDir string, count int) ([]*VM, error) {
+// Branch takes a diff snapshot, merges it with the baseline, and restores N copies in parallel.
+// The merged mem file is shared across all branches (MAP_PRIVATE/CoW).
+func Branch(cfg Config, source *VM, count int) ([]*VM, error) {
+	if source.BaselineDir == "" {
+		return branchFull(cfg, source, count)
+	}
+
+	snapshotDir := filepath.Join(cfg.WorkDir, "snapshots", source.ID)
+
+	// Diff snapshot — only pages dirtied since baseline
 	start := time.Now()
-	if err := source.Snapshot(snapshotDir, false); err != nil {
-		return nil, fmt.Errorf("snapshot source: %w", err)
+	if err := source.Snapshot(snapshotDir, true); err != nil {
+		return nil, fmt.Errorf("diff snapshot: %w", err)
 	}
 	snapDuration := time.Since(start)
 
 	if err := source.Resume(); err != nil {
-		klog.Warningf("branch: failed to resume source VM %s: %v", source.ID, err)
+		klog.Warningf("branch: failed to resume source: %v", err)
 	}
-	klog.Infof("branch: full snapshot took %v, source resumed", snapDuration)
+	klog.Infof("branch: diff snapshot took %v, source resumed", snapDuration)
 
-	sharedMemPath := filepath.Join(snapshotDir, "mem")
-	srcVmstatePath := filepath.Join(snapshotDir, "vmstate")
+	// Merge: reflink base + overlay dirty pages → complete mem
+	mergedMem := filepath.Join(snapshotDir, "mem-merged")
+	mergeStart := time.Now()
+	if err := mergeSnapshot(
+		filepath.Join(source.BaselineDir, "mem"),
+		filepath.Join(snapshotDir, "mem"),
+		mergedMem,
+	); err != nil {
+		return nil, fmt.Errorf("merge snapshot: %w", err)
+	}
+	klog.Infof("branch: merge took %v", time.Since(mergeStart))
 
+	srcVmstate := filepath.Join(snapshotDir, "vmstate")
+
+	// Parallel restore — all branches share the merged mem file
 	type result struct {
 		idx int
 		vm  *VM
@@ -283,27 +296,24 @@ func Branch(cfg Config, source *VM, snapshotDir string, count int) ([]*VM, error
 			branchID := fmt.Sprintf("%s-branch-%d", source.ID, i)
 			branchDir := filepath.Join(cfg.WorkDir, branchID)
 			if err := os.MkdirAll(branchDir, 0o755); err != nil {
-				ch <- result{idx: i, err: fmt.Errorf("mkdir: %w", err)}
-				return
-			}
-
-			// Copy only vmstate (tiny). Mem file is shared across all branches.
-			branchVmstate := filepath.Join(branchDir, "vmstate")
-			copyStart := time.Now()
-			if err := ReflinkCopy(srcVmstatePath, branchVmstate); err != nil {
 				ch <- result{idx: i, err: err}
 				return
 			}
-			copyDuration := time.Since(copyStart)
+
+			branchVmstate := filepath.Join(branchDir, "vmstate")
+			if err := ReflinkCopy(srcVmstate, branchVmstate); err != nil {
+				ch <- result{idx: i, err: err}
+				return
+			}
 
 			restoreStart := time.Now()
-			vm, err := Restore(cfg, branchID, source.Image, branchVmstate, sharedMemPath)
+			vm, err := Restore(cfg, branchID, source.Image, branchVmstate, mergedMem)
 			if err != nil {
 				ch <- result{idx: i, err: fmt.Errorf("restore branch %d: %w", i, err)}
 				return
 			}
 
-			klog.Infof("branch %d: copy=%v restore=%v", i, copyDuration, time.Since(restoreStart))
+			klog.Infof("branch %d: restore=%v", i, time.Since(restoreStart))
 			ch <- result{idx: i, vm: vm}
 		}(i)
 	}
@@ -331,7 +341,147 @@ func Branch(cfg Config, source *VM, snapshotDir string, count int) ([]*VM, error
 	return branches, nil
 }
 
-// ReflinkCopy copies a file using reflink (CoW) if supported, falling back to regular copy.
+// branchFull is the fallback when no baseline exists (full snapshot).
+func branchFull(cfg Config, source *VM, count int) ([]*VM, error) {
+	snapshotDir := filepath.Join(cfg.WorkDir, "snapshots", source.ID)
+
+	start := time.Now()
+	if err := source.Snapshot(snapshotDir, false); err != nil {
+		return nil, fmt.Errorf("snapshot source: %w", err)
+	}
+	klog.Infof("branch: full snapshot took %v", time.Since(start))
+
+	if err := source.Resume(); err != nil {
+		klog.Warningf("branch: failed to resume source: %v", err)
+	}
+
+	sharedMem := filepath.Join(snapshotDir, "mem")
+	srcVmstate := filepath.Join(snapshotDir, "vmstate")
+
+	type result struct {
+		idx int
+		vm  *VM
+		err error
+	}
+	ch := make(chan result, count)
+	var wg sync.WaitGroup
+
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			branchID := fmt.Sprintf("%s-branch-%d", source.ID, i)
+			branchDir := filepath.Join(cfg.WorkDir, branchID)
+			os.MkdirAll(branchDir, 0o755)
+
+			branchVmstate := filepath.Join(branchDir, "vmstate")
+			ReflinkCopy(srcVmstate, branchVmstate)
+
+			restoreStart := time.Now()
+			vm, err := Restore(cfg, branchID, source.Image, branchVmstate, sharedMem)
+			if err != nil {
+				ch <- result{idx: i, err: err}
+				return
+			}
+			klog.Infof("branch %d: restore=%v", i, time.Since(restoreStart))
+			ch <- result{idx: i, vm: vm}
+		}(i)
+	}
+
+	go func() { wg.Wait(); close(ch) }()
+
+	branches := make([]*VM, count)
+	var firstErr error
+	for r := range ch {
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+		if r.vm != nil {
+			branches[r.idx] = r.vm
+		}
+	}
+	if firstErr != nil {
+		for _, b := range branches {
+			if b != nil {
+				b.Destroy()
+			}
+		}
+		return nil, firstErr
+	}
+	return branches, nil
+}
+
+// mergeSnapshot creates a complete memory file by reflinking the base and
+// overlaying only the dirty pages from the diff using SEEK_DATA/SEEK_HOLE.
+func mergeSnapshot(baseMem, diffMem, outputMem string) error {
+	if err := ReflinkCopy(baseMem, outputMem); err != nil {
+		return fmt.Errorf("reflink base: %w", err)
+	}
+
+	diff, err := os.Open(diffMem)
+	if err != nil {
+		return fmt.Errorf("open diff: %w", err)
+	}
+	defer diff.Close()
+
+	out, err := os.OpenFile(outputMem, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open output: %w", err)
+	}
+	defer out.Close()
+
+	diffFd := int(diff.Fd())
+	fi, err := diff.Stat()
+	if err != nil {
+		return err
+	}
+	fileSize := fi.Size()
+
+	const (
+		seekData = 3 // SEEK_DATA
+		seekHole = 4 // SEEK_HOLE
+	)
+
+	buf := make([]byte, 256*1024) // 256KB copy buffer
+	offset := int64(0)
+	copied := int64(0)
+
+	for offset < fileSize {
+		dataStart, err := syscall.Seek(diffFd, offset, seekData)
+		if err != nil {
+			break
+		}
+		holeStart, err := syscall.Seek(diffFd, dataStart, seekHole)
+		if err != nil {
+			holeStart = fileSize
+		}
+
+		for pos := dataStart; pos < holeStart; {
+			n := int64(len(buf))
+			if pos+n > holeStart {
+				n = holeStart - pos
+			}
+			nr, err := diff.ReadAt(buf[:n], pos)
+			if nr > 0 {
+				if _, werr := out.WriteAt(buf[:nr], pos); werr != nil {
+					return fmt.Errorf("write at %d: %w", pos, werr)
+				}
+				copied += int64(nr)
+			}
+			if err != nil {
+				break
+			}
+			pos += int64(nr)
+		}
+
+		offset = holeStart
+	}
+
+	klog.Infof("merge: overlaid %d bytes of dirty pages onto reflinked base", copied)
+	return nil
+}
+
+// ReflinkCopy copies a file using reflink (CoW) if supported.
 func ReflinkCopy(src, dst string) error {
 	cmd := exec.Command("cp", "--reflink=auto", src, dst)
 	if err := cmd.Run(); err != nil {
@@ -340,7 +490,6 @@ func ReflinkCopy(src, dst string) error {
 	return nil
 }
 
-// vsockConnect connects to a guest vsock port via Firecracker's UDS.
 func vsockConnect(udsPath string, port uint32) (net.Conn, error) {
 	conn, err := net.Dial("unix", udsPath)
 	if err != nil {
@@ -350,8 +499,6 @@ func vsockConnect(udsPath string, port uint32) (net.Conn, error) {
 		conn.Close()
 		return nil, err
 	}
-	// Read response byte-by-byte to avoid buffered reader consuming data
-	// past the newline (which belongs to the guest agent protocol).
 	var resp []byte
 	buf := make([]byte, 1)
 	for {
@@ -367,10 +514,9 @@ func vsockConnect(udsPath string, port uint32) (net.Conn, error) {
 			}
 		}
 	}
-	line := string(resp)
-	if !strings.HasPrefix(line, "OK ") {
+	if !strings.HasPrefix(string(resp), "OK ") {
 		conn.Close()
-		return nil, fmt.Errorf("vsock CONNECT failed: %s", strings.TrimSpace(line))
+		return nil, fmt.Errorf("vsock CONNECT failed: %s", strings.TrimSpace(string(resp)))
 	}
 	return conn, nil
 }
