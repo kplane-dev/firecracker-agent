@@ -108,11 +108,6 @@ func (p *Pool) Fill() error {
 				continue
 			}
 
-			// Reset dirty pages so future diff snapshots are small
-			if err := v.ResetDirtyPages(); err != nil {
-				klog.Warningf("pool: dirty page reset failed for %s: %v", v.ID, err)
-			}
-
 			p.mu.Lock()
 			p.warm[image] = append(p.warm[image], v)
 			klog.Infof("pool: pre-booted warm VM %s (image=%s) in %v (%d/%d warm)",
