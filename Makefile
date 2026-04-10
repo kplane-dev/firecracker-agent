@@ -1,10 +1,10 @@
-.PHONY: all images agent docker download-firecracker download-kernel download clean
+.PHONY: all images agent guest-agent docker download-firecracker download-kernel download clean
 
 FC_VERSION ?= v1.12.0
 FC_ARCH    ?= x86_64
 IMAGE_TAG  ?= ghcr.io/kplane-dev/firecracker-agent:latest
 
-all: download images agent
+all: download guest-agent images agent
 
 # --- Downloads ---
 
@@ -24,10 +24,17 @@ download-kernel:
 		-o out/bin/vmlinux
 	@echo "-> out/bin/vmlinux"
 
+# --- Guest agent (runs inside VM) ---
+
+guest-agent:
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o images/base/guest-agent ./cmd/guest-agent
+	@echo "-> images/base/guest-agent"
+
 # --- Rootfs images ---
 
-images:
+images: guest-agent
 	./images/build.sh out/images
+	rm -f images/base/guest-agent
 
 # --- Go binary ---
 
@@ -42,4 +49,4 @@ docker: all
 # --- Clean ---
 
 clean:
-	rm -rf out/ bin/
+	rm -rf out/ bin/ images/base/guest-agent

@@ -4,4 +4,5 @@ FROM alpine:3.22
 RUN apk add --no-cache busybox-extras
 
 COPY init /init
-RUN chmod +x /init
+COPY guest-agent /usr/local/bin/guest-agent
+RUN chmod +x /init /usr/local/bin/guest-agent

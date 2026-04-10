@@ -2,6 +2,7 @@
 package vm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -12,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -39,6 +42,7 @@ type VM struct {
 	ID         string
 	Image      string
 	SocketPath string
+	VsockPath  string
 	IP         string
 	PID        int
 	StartedAt  time.Time
@@ -55,9 +59,11 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int) (*VM, erro
 		return nil, fmt.Errorf("create socket dir: %w", err)
 	}
 	socketPath := filepath.Join(socketDir, "fc.sock")
+	vsockPath := filepath.Join(socketDir, "vsock.sock")
 
-	// Remove stale socket
+	// Remove stale sockets
 	os.Remove(socketPath)
+	os.Remove(vsockPath)
 
 	cmd := exec.Command(cfg.FirecrackerBin, "--api-sock", socketPath)
 	cmd.Stdout = io.Discard
@@ -71,6 +77,7 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int) (*VM, erro
 		ID:         id,
 		Image:      image,
 		SocketPath: socketPath,
+		VsockPath:  vsockPath,
 		Config:     cfg,
 		cmd:        cmd,
 		client: &http.Client{
@@ -103,12 +110,21 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int) (*VM, erro
 
 	// Configure machine with dirty page tracking for diff snapshots
 	if err := vm.apiPut("/machine-config", map[string]interface{}{
-		"vcpu_count":       vcpus,
-		"mem_size_mib":     memMiB,
+		"vcpu_count":        vcpus,
+		"mem_size_mib":      memMiB,
 		"track_dirty_pages": true,
 	}); err != nil {
 		cmd.Process.Kill()
 		return nil, fmt.Errorf("set machine config: %w", err)
+	}
+
+	// Configure vsock for guest agent communication
+	if err := vm.apiPut("/vsock", map[string]interface{}{
+		"guest_cid": 3,
+		"uds_path":  vsockPath,
+	}); err != nil {
+		cmd.Process.Kill()
+		return nil, fmt.Errorf("set vsock: %w", err)
 	}
 
 	// Start the VM
@@ -138,14 +154,13 @@ func (vm *VM) Destroy() error {
 }
 
 // Snapshot pauses the VM and saves its state.
-// If diff is true, only dirty pages since last snapshot are saved (~15ms).
-// If diff is false, a full snapshot is taken (~150ms).
+// If diff is true, only dirty pages since last snapshot are saved.
+// If diff is false, a full snapshot is taken.
 func (vm *VM) Snapshot(snapshotDir string, diff bool) error {
 	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
 		return fmt.Errorf("create snapshot dir: %w", err)
 	}
 
-	// Pause the VM (PATCH /vm, not PUT /actions)
 	if err := vm.apiPatch("/vm", map[string]interface{}{
 		"state": "Paused",
 	}); err != nil {
@@ -157,7 +172,6 @@ func (vm *VM) Snapshot(snapshotDir string, diff bool) error {
 		snapshotType = "Diff"
 	}
 
-	// Create snapshot
 	if err := vm.apiPut("/snapshot/create", map[string]interface{}{
 		"snapshot_type": snapshotType,
 		"snapshot_path": filepath.Join(snapshotDir, "vmstate"),
@@ -177,6 +191,70 @@ func (vm *VM) Resume() error {
 	})
 }
 
+// ResetDirtyPages takes a throwaway diff snapshot to clear the dirty page bitmap.
+// This makes subsequent diff snapshots much smaller and faster.
+func (vm *VM) ResetDirtyPages() error {
+	tmpDir := filepath.Join(vm.Config.WorkDir, ".warmup-"+vm.ID)
+	defer os.RemoveAll(tmpDir)
+
+	if err := vm.Snapshot(tmpDir, true); err != nil {
+		return err
+	}
+	return vm.Resume()
+}
+
+// Exec runs a command inside the VM via the vsock guest agent.
+func (vm *VM) Exec(cmd []string, timeout time.Duration) (stdout, stderr string, exitCode int, err error) {
+	conn, err := vsockConnect(vm.VsockPath, 1024)
+	if err != nil {
+		return "", "", -1, fmt.Errorf("vsock connect: %w", err)
+	}
+	if timeout > 0 {
+		conn.SetDeadline(time.Now().Add(timeout))
+	}
+	defer conn.Close()
+
+	req := struct {
+		Cmd []string `json:"cmd"`
+	}{Cmd: cmd}
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return "", "", -1, fmt.Errorf("send: %w", err)
+	}
+
+	var resp struct {
+		Stdout   string `json:"stdout"`
+		Stderr   string `json:"stderr"`
+		ExitCode int    `json:"exit_code"`
+	}
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return "", "", -1, fmt.Errorf("recv: %w", err)
+	}
+	return resp.Stdout, resp.Stderr, resp.ExitCode, nil
+}
+
+// vsockConnect connects to a guest vsock port via Firecracker's UDS.
+func vsockConnect(udsPath string, port uint32) (net.Conn, error) {
+	conn, err := net.Dial("unix", udsPath)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", port); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if !strings.HasPrefix(line, "OK ") {
+		conn.Close()
+		return nil, fmt.Errorf("vsock CONNECT failed: %s", strings.TrimSpace(line))
+	}
+	return conn, nil
+}
+
 // Restore boots a new VM from a snapshot.
 func Restore(cfg Config, id string, image string, snapshotDir string) (*VM, error) {
 	socketDir := filepath.Join(cfg.WorkDir, id)
@@ -184,7 +262,9 @@ func Restore(cfg Config, id string, image string, snapshotDir string) (*VM, erro
 		return nil, fmt.Errorf("create socket dir: %w", err)
 	}
 	socketPath := filepath.Join(socketDir, "fc.sock")
+	vsockPath := filepath.Join(socketDir, "vsock.sock")
 	os.Remove(socketPath)
+	os.Remove(vsockPath)
 
 	cmd := exec.Command(cfg.FirecrackerBin, "--api-sock", socketPath)
 	cmd.Stdout = io.Discard
@@ -198,6 +278,7 @@ func Restore(cfg Config, id string, image string, snapshotDir string) (*VM, erro
 		ID:         id,
 		Image:      image,
 		SocketPath: socketPath,
+		VsockPath:  vsockPath,
 		Config:     cfg,
 		cmd:        cmd,
 		client: &http.Client{
@@ -210,7 +291,6 @@ func Restore(cfg Config, id string, image string, snapshotDir string) (*VM, erro
 		},
 	}
 
-	// Wait for socket
 	for i := 0; i < 50; i++ {
 		if _, err := os.Stat(socketPath); err == nil {
 			break
@@ -218,13 +298,12 @@ func Restore(cfg Config, id string, image string, snapshotDir string) (*VM, erro
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Load snapshot
 	start := time.Now()
 	if err := vm.apiPut("/snapshot/load", map[string]interface{}{
-		"snapshot_path":    filepath.Join(snapshotDir, "vmstate"),
+		"snapshot_path": filepath.Join(snapshotDir, "vmstate"),
 		"mem_backend": map[string]interface{}{
-			"backend_type":  "File",
-			"backend_path":  filepath.Join(snapshotDir, "mem"),
+			"backend_type": "File",
+			"backend_path": filepath.Join(snapshotDir, "mem"),
 		},
 		"enable_diff_snapshots": false,
 		"resume_vm":             true,
@@ -274,7 +353,6 @@ func (vm *VM) apiPatch(path string, body interface{}) error {
 
 // ReflinkCopy copies a file using reflink (CoW) if supported, falling back to regular copy.
 func ReflinkCopy(src, dst string) error {
-	// Try reflink first (btrfs/XFS)
 	cmd := exec.Command("cp", "--reflink=auto", src, dst)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("reflink copy %s -> %s: %w", src, dst, err)
@@ -282,58 +360,86 @@ func ReflinkCopy(src, dst string) error {
 	return nil
 }
 
-// Branch snapshots the source VM and restores N copies from the snapshot.
-// Uses reflink copies when the filesystem supports it (btrfs/XFS).
-// Branch snapshots the source VM using a diff snapshot and restores N copies.
-// The source VM is resumed after the snapshot is taken.
+// Branch takes a diff snapshot of the source VM and restores N copies in parallel.
+// The source VM is resumed immediately after the snapshot.
 // Uses reflink copies when the filesystem supports it (btrfs/XFS).
 func Branch(cfg Config, source *VM, snapshotDir string, count int) ([]*VM, error) {
-	// Diff snapshot the source (~15ms vs ~150ms for full)
 	start := time.Now()
 	if err := source.Snapshot(snapshotDir, true); err != nil {
 		return nil, fmt.Errorf("snapshot source: %w", err)
 	}
 	snapDuration := time.Since(start)
 
-	// Resume the source VM immediately — it only needs to be paused
-	// for the duration of the diff snapshot (~15ms).
 	if err := source.Resume(); err != nil {
 		klog.Warningf("branch: failed to resume source VM %s: %v", source.ID, err)
 	}
-
 	klog.Infof("branch: diff snapshot took %v, source resumed", snapDuration)
 
-	// Restore N copies
-	var branches []*VM
+	// Restore all branches in parallel
+	type result struct {
+		idx int
+		vm  *VM
+		err error
+	}
+	ch := make(chan result, count)
+
+	var wg sync.WaitGroup
 	for i := 0; i < count; i++ {
-		branchID := fmt.Sprintf("%s-branch-%d", source.ID, i)
-		branchSnapDir := filepath.Join(filepath.Dir(snapshotDir), branchID+"-snap")
-		if err := os.MkdirAll(branchSnapDir, 0o755); err != nil {
-			return branches, fmt.Errorf("create branch snap dir: %w", err)
-		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			branchID := fmt.Sprintf("%s-branch-%d", source.ID, i)
+			branchSnapDir := filepath.Join(filepath.Dir(snapshotDir), branchID+"-snap")
+			if err := os.MkdirAll(branchSnapDir, 0o755); err != nil {
+				ch <- result{idx: i, err: fmt.Errorf("mkdir: %w", err)}
+				return
+			}
 
-		// Reflink copy the snapshot files
-		copyStart := time.Now()
-		if err := ReflinkCopy(filepath.Join(snapshotDir, "vmstate"), filepath.Join(branchSnapDir, "vmstate")); err != nil {
-			return branches, err
-		}
-		if err := ReflinkCopy(filepath.Join(snapshotDir, "mem"), filepath.Join(branchSnapDir, "mem")); err != nil {
-			return branches, err
-		}
-		copyDuration := time.Since(copyStart)
+			copyStart := time.Now()
+			if err := ReflinkCopy(filepath.Join(snapshotDir, "vmstate"), filepath.Join(branchSnapDir, "vmstate")); err != nil {
+				ch <- result{idx: i, err: err}
+				return
+			}
+			if err := ReflinkCopy(filepath.Join(snapshotDir, "mem"), filepath.Join(branchSnapDir, "mem")); err != nil {
+				ch <- result{idx: i, err: err}
+				return
+			}
+			copyDuration := time.Since(copyStart)
 
-		// Restore
-		restoreStart := time.Now()
-		vm, err := Restore(cfg, branchID, source.Image, branchSnapDir)
-		if err != nil {
-			return branches, fmt.Errorf("restore branch %d: %w", i, err)
-		}
-		restoreDuration := time.Since(restoreStart)
+			restoreStart := time.Now()
+			vm, err := Restore(cfg, branchID, source.Image, branchSnapDir)
+			if err != nil {
+				ch <- result{idx: i, err: fmt.Errorf("restore branch %d: %w", i, err)}
+				return
+			}
+			restoreDuration := time.Since(restoreStart)
 
-		klog.Infof("branch %d: copy=%v restore=%v total=%v",
-			i, copyDuration, restoreDuration, time.Since(copyStart))
-		branches = append(branches, vm)
+			klog.Infof("branch %d: copy=%v restore=%v total=%v",
+				i, copyDuration, restoreDuration, time.Since(copyStart))
+			ch <- result{idx: i, vm: vm}
+		}(i)
 	}
 
+	go func() { wg.Wait(); close(ch) }()
+
+	branches := make([]*VM, count)
+	var firstErr error
+	for r := range ch {
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+		if r.vm != nil {
+			branches[r.idx] = r.vm
+		}
+	}
+
+	if firstErr != nil {
+		for _, b := range branches {
+			if b != nil {
+				b.Destroy()
+			}
+		}
+		return nil, firstErr
+	}
 	return branches, nil
 }

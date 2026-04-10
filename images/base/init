@@ -13,6 +13,8 @@ mount -t tmpfs tmpfs /run
 hostname sandbox
 ip link set lo up 2>/dev/null
 
-# Serial console — the host communicates via ttyS0.
-# Future: replace with vsock guest agent.
+# Start guest agent for vsock communication with the host
+/usr/local/bin/guest-agent &
+
+# Serial console fallback
 exec setsid sh -l </dev/ttyS0 >/dev/ttyS0 2>&1

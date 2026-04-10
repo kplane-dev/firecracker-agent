@@ -153,6 +153,33 @@ func main() {
 		json.NewEncoder(w).Encode(result)
 	})
 
+	mux.HandleFunc("/exec", func(w http.ResponseWriter, r *http.Request) {
+		vmID := r.URL.Query().Get("vm_id")
+		cmdStr := r.URL.Query().Get("cmd")
+		if vmID == "" || cmdStr == "" {
+			http.Error(w, "vm_id and cmd required", http.StatusBadRequest)
+			return
+		}
+
+		v := p.GetActive(vmID)
+		if v == nil {
+			http.Error(w, "VM not found", http.StatusNotFound)
+			return
+		}
+
+		parts := strings.Fields(cmdStr)
+		stdout, stderr, exitCode, err := v.Exec(parts, 30*time.Second)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"stdout":    stdout,
+			"stderr":    stderr,
+			"exit_code": exitCode,
+		})
+	})
+
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "ok")
 	})
