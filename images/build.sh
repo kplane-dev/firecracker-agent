@@ -10,21 +10,23 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT_DIR="${1:-${SCRIPT_DIR}/../out/images}"
 mkdir -p "$OUT_DIR"
 
-echo "=== Building base rootfs ==="
-docker build -t rootfs-base "$SCRIPT_DIR/base/"
+PLATFORM="${PLATFORM:-linux/amd64}"
+
+echo "=== Building base rootfs (${PLATFORM}) ==="
+docker build --platform "$PLATFORM" -t rootfs-base "$SCRIPT_DIR/base/"
 
 build_initrd() {
     local name=$1
-    echo "=== Building $name rootfs ==="
+    echo "=== Building $name rootfs (${PLATFORM}) ==="
 
-    docker build -t "rootfs-${name}" "$SCRIPT_DIR/${name}/"
+    docker build --platform "$PLATFORM" -t "rootfs-${name}" "$SCRIPT_DIR/${name}/"
 
     local cid
-    cid=$(docker create "rootfs-${name}" /bin/true)
+    cid=$(docker create --platform "$PLATFORM" "rootfs-${name}" /bin/true)
 
     # Convert Docker filesystem to cpio initrd inside a container
     # (preserves permissions and device nodes without requiring host root)
-    docker export "$cid" | docker run --rm -i alpine:3.22 sh -c '
+    docker export "$cid" | docker run --rm --platform "$PLATFORM" -i alpine:3.22 sh -c '
         apk add --no-cache cpio >/dev/null 2>&1
         mkdir /rootfs && cd /rootfs
         tar xf -
