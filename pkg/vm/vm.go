@@ -165,6 +165,19 @@ func (vm *VM) Resume() error {
 	})
 }
 
+// WaitReady polls the vsock guest agent until it responds or the timeout expires.
+func (vm *VM) WaitReady(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_, _, _, err := vm.Exec([]string{"/bin/true"}, 2*time.Second)
+		if err == nil {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("guest agent not ready after %v", timeout)
+}
+
 // Exec runs a command inside the VM via the vsock guest agent.
 func (vm *VM) Exec(cmd []string, timeout time.Duration) (stdout, stderr string, exitCode int, err error) {
 	conn, err := vsockConnect(vm.VsockPath, 1024)

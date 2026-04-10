@@ -118,8 +118,10 @@ func (p *Pool) Fill() error {
 				continue
 			}
 
-			// Let guest settle (init + guest-agent startup)
-			time.Sleep(2 * time.Second)
+			// Wait for guest agent to be ready
+			if err := v.WaitReady(5 * time.Second); err != nil {
+				klog.Warningf("pool: guest agent not ready for %s: %v", v.ID, err)
+			}
 
 			// Take baseline snapshot and leave VM paused.
 			// This resets dirty page tracking — future diff snapshots
