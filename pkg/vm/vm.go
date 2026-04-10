@@ -209,6 +209,20 @@ func (vm *VM) Exec(cmd []string, timeout time.Duration) (stdout, stderr string, 
 
 // Restore boots a new VM from a snapshot.
 func Restore(cfg Config, id string, image string, vmstatePath string, memPath string) (*VM, error) {
+	vm, err := PrepareRestore(cfg, id, image)
+	if err != nil {
+		return nil, err
+	}
+	if err := vm.LoadSnapshot(vmstatePath, memPath); err != nil {
+		return nil, err
+	}
+	return vm, nil
+}
+
+// PrepareRestore starts a Firecracker process and waits for its API socket.
+// Call LoadSnapshot to actually load VM state. This split allows overlapping
+// process startup with other work (e.g., merge).
+func PrepareRestore(cfg Config, id string, image string) (*VM, error) {
 	socketDir := filepath.Join(cfg.WorkDir, id)
 	if err := os.MkdirAll(socketDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create socket dir: %w", err)
@@ -236,7 +250,11 @@ func Restore(cfg Config, id string, image string, vmstatePath string, memPath st
 	}
 
 	waitForSocket(socketPath)
+	return vm, nil
+}
 
+// LoadSnapshot loads a snapshot into a prepared Firecracker process.
+func (vm *VM) LoadSnapshot(vmstatePath string, memPath string) error {
 	start := time.Now()
 	if err := vm.apiPut("/snapshot/load", map[string]interface{}{
 		"snapshot_path": vmstatePath,
@@ -247,15 +265,14 @@ func Restore(cfg Config, id string, image string, vmstatePath string, memPath st
 		"enable_diff_snapshots": false,
 		"resume_vm":             true,
 	}); err != nil {
-		cmd.Process.Kill()
-		return nil, fmt.Errorf("load snapshot: %w", err)
+		vm.cmd.Process.Kill()
+		return fmt.Errorf("load snapshot: %w", err)
 	}
 
 	vm.StartedAt = start
-	vm.PID = cmd.Process.Pid
-
-	klog.Infof("vm %s restored in %v", id, time.Since(start))
-	return vm, nil
+	vm.PID = vm.cmd.Process.Pid
+	klog.Infof("vm %s restored in %v", vm.ID, time.Since(start))
+	return nil
 }
 
 // Branch takes a diff snapshot, merges it with the baseline, and restores N copies in parallel.
@@ -284,8 +301,43 @@ func Branch(cfg Config, source *VM, count int) ([]*VM, error) {
 	}
 	klog.Infof("branch: diff snapshot took %v, source resumed", snapDuration)
 
-	// Merge: reflink base (on btrfs) + overlay dirty pages from diff (on tmpfs).
-	// Output goes to btrfs so reflink works (tmpfs doesn't support reflink).
+	srcVmstate := filepath.Join(snapshotDir, "vmstate")
+
+	// Pre-start Firecracker processes + copy vmstate while merge runs.
+	// This overlaps process startup (~5ms each) with the merge step.
+	type prepared struct {
+		vm        *VM
+		vmstate   string
+		err       error
+	}
+	preps := make([]prepared, count)
+	var prepWg sync.WaitGroup
+
+	for i := 0; i < count; i++ {
+		prepWg.Add(1)
+		go func(i int) {
+			defer prepWg.Done()
+			branchID := fmt.Sprintf("%s-branch-%d", source.ID, i)
+			branchDir := filepath.Join(cfg.WorkDir, branchID)
+			if err := os.MkdirAll(branchDir, 0o755); err != nil {
+				preps[i] = prepared{err: err}
+				return
+			}
+			branchVmstate := filepath.Join(branchDir, "vmstate")
+			if err := ReflinkCopy(srcVmstate, branchVmstate); err != nil {
+				preps[i] = prepared{err: err}
+				return
+			}
+			vm, err := PrepareRestore(cfg, branchID, source.Image)
+			if err != nil {
+				preps[i] = prepared{err: err}
+				return
+			}
+			preps[i] = prepared{vm: vm, vmstate: branchVmstate}
+		}(i)
+	}
+
+	// Merge runs concurrently with process preparation above
 	mergeDir := filepath.Join(cfg.WorkDir, "snapshots", source.ID)
 	os.MkdirAll(mergeDir, 0o755)
 	mergedMem := filepath.Join(mergeDir, "mem-merged")
@@ -299,47 +351,37 @@ func Branch(cfg Config, source *VM, count int) ([]*VM, error) {
 	}
 	klog.Infof("branch: merge took %v", time.Since(mergeStart))
 
-	srcVmstate := filepath.Join(snapshotDir, "vmstate")
+	prepWg.Wait()
 
-	// Parallel restore — all branches share the merged mem file
+	// Load snapshots in parallel — processes are already running
 	type result struct {
 		idx int
 		vm  *VM
 		err error
 	}
 	ch := make(chan result, count)
-	var wg sync.WaitGroup
+	var loadWg sync.WaitGroup
 
 	for i := 0; i < count; i++ {
-		wg.Add(1)
+		if preps[i].err != nil {
+			ch <- result{idx: i, err: preps[i].err}
+			continue
+		}
+		loadWg.Add(1)
 		go func(i int) {
-			defer wg.Done()
-			branchID := fmt.Sprintf("%s-branch-%d", source.ID, i)
-			branchDir := filepath.Join(cfg.WorkDir, branchID)
-			if err := os.MkdirAll(branchDir, 0o755); err != nil {
+			defer loadWg.Done()
+			loadStart := time.Now()
+			if err := preps[i].vm.LoadSnapshot(preps[i].vmstate, mergedMem); err != nil {
 				ch <- result{idx: i, err: err}
+				preps[i].vm.Destroy()
 				return
 			}
-
-			branchVmstate := filepath.Join(branchDir, "vmstate")
-			if err := ReflinkCopy(srcVmstate, branchVmstate); err != nil {
-				ch <- result{idx: i, err: err}
-				return
-			}
-
-			restoreStart := time.Now()
-			vm, err := Restore(cfg, branchID, source.Image, branchVmstate, mergedMem)
-			if err != nil {
-				ch <- result{idx: i, err: fmt.Errorf("restore branch %d: %w", i, err)}
-				return
-			}
-
-			klog.Infof("branch %d: restore=%v", i, time.Since(restoreStart))
-			ch <- result{idx: i, vm: vm}
+			klog.Infof("branch %d: load=%v", i, time.Since(loadStart))
+			ch <- result{idx: i, vm: preps[i].vm}
 		}(i)
 	}
 
-	go func() { wg.Wait(); close(ch) }()
+	go func() { loadWg.Wait(); close(ch) }()
 
 	branches := make([]*VM, count)
 	var firstErr error
