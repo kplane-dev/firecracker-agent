@@ -167,8 +167,7 @@ func main() {
 			return
 		}
 
-		parts := strings.Fields(cmdStr)
-		stdout, stderr, exitCode, err := v.Exec(parts, 30*time.Second)
+		stdout, stderr, exitCode, err := v.Exec([]string{"/bin/sh", "-c", cmdStr}, 30*time.Second)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
