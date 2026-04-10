@@ -30,7 +30,7 @@ type ExecResponse struct {
 }
 
 func main() {
-	ln, err := listenVsock(agentPort)
+	listenFd, err := vsockListen(agentPort)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "guest-agent: listen vsock port %d: %v\n", agentPort, err)
 		os.Exit(1)
@@ -38,9 +38,16 @@ func main() {
 	fmt.Fprintf(os.Stderr, "guest-agent: listening on vsock port %d\n", agentPort)
 
 	for {
-		conn, err := ln.Accept()
+		connFd, _, err := syscall.Accept(listenFd)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "guest-agent: accept: %v\n", err)
+			continue
+		}
+		f := os.NewFile(uintptr(connFd), "vsock-conn")
+		conn, err := net.FileConn(f)
+		f.Close()
+		if err != nil {
+			syscall.Close(connFd)
 			continue
 		}
 		go handleConn(conn)
@@ -85,32 +92,25 @@ type sockaddrVM struct {
 	zero      [3]uint8
 }
 
-func listenVsock(port uint32) (net.Listener, error) {
+func vsockListen(port uint32) (int, error) {
 	fd, err := syscall.Socket(afVsock, syscall.SOCK_STREAM, 0)
 	if err != nil {
-		return nil, fmt.Errorf("socket: %w", err)
+		return -1, fmt.Errorf("socket: %w", err)
 	}
 	sa := sockaddrVM{
 		family: afVsock,
 		port:   port,
 		cid:    vmaddrCIDAny,
 	}
-	// Bind using RawSockaddr
 	_, _, errno := syscall.Syscall(syscall.SYS_BIND, uintptr(fd),
 		uintptr(unsafe.Pointer(&sa)), unsafe.Sizeof(sa))
 	if errno != 0 {
 		syscall.Close(fd)
-		return nil, fmt.Errorf("bind: %w", errno)
+		return -1, fmt.Errorf("bind: %w", errno)
 	}
 	if err := syscall.Listen(fd, 5); err != nil {
 		syscall.Close(fd)
-		return nil, fmt.Errorf("listen: %w", err)
+		return -1, fmt.Errorf("listen: %w", err)
 	}
-	f := os.NewFile(uintptr(fd), fmt.Sprintf("vsock:%d", port))
-	ln, err := net.FileListener(f)
-	f.Close()
-	if err != nil {
-		return nil, fmt.Errorf("file listener: %w", err)
-	}
-	return ln, nil
+	return fd, nil
 }
