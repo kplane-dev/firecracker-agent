@@ -47,16 +47,23 @@ func main() {
 }
 
 func handleConn(fd int) {
-	f := os.NewFile(uintptr(fd), "vsock-conn")
-	defer f.Close()
+	defer syscall.Close(fd)
+
+	// Raw syscall read — Go's os.File/net.Conn poller doesn't support AF_VSOCK.
+	buf := make([]byte, 65536)
+	n, err := syscall.Read(fd, buf)
+	if err != nil || n == 0 {
+		writeJSON(fd, ExecResponse{Stderr: fmt.Sprintf("read: %v (n=%d)", err, n), ExitCode: 1})
+		return
+	}
 
 	var req ExecRequest
-	if err := json.NewDecoder(f).Decode(&req); err != nil {
-		writeResponse(f, ExecResponse{Stderr: fmt.Sprintf("decode: %v", err), ExitCode: 1})
+	if err := json.Unmarshal(buf[:n], &req); err != nil {
+		writeJSON(fd, ExecResponse{Stderr: fmt.Sprintf("decode: %v", err), ExitCode: 1})
 		return
 	}
 	if len(req.Cmd) == 0 {
-		writeResponse(f, ExecResponse{Stderr: "empty command", ExitCode: 1})
+		writeJSON(fd, ExecResponse{Stderr: "empty command", ExitCode: 1})
 		return
 	}
 
@@ -72,14 +79,15 @@ func handleConn(fd int) {
 			resp.Stderr = err.Error()
 		}
 	}
-	writeResponse(f, resp)
+	writeJSON(fd, resp)
 }
 
-func writeResponse(f *os.File, resp ExecResponse) {
-	json.NewEncoder(f).Encode(resp)
+func writeJSON(fd int, v interface{}) {
+	data, _ := json.Marshal(v)
+	data = append(data, '\n')
+	syscall.Write(fd, data)
 }
 
-// sockaddrVM mirrors struct sockaddr_vm from linux/vm_sockets.h.
 type sockaddrVM struct {
 	family    uint16
 	reserved1 uint16
@@ -94,11 +102,7 @@ func vsockListen(port uint32) (int, error) {
 	if err != nil {
 		return -1, fmt.Errorf("socket: %w", err)
 	}
-	sa := sockaddrVM{
-		family: afVsock,
-		port:   port,
-		cid:    vmaddrCIDAny,
-	}
+	sa := sockaddrVM{family: afVsock, port: port, cid: vmaddrCIDAny}
 	_, _, errno := syscall.Syscall(syscall.SYS_BIND, uintptr(fd),
 		uintptr(unsafe.Pointer(&sa)), unsafe.Sizeof(sa))
 	if errno != 0 {
