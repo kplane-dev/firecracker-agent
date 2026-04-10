@@ -52,7 +52,7 @@ func EnsureMount(dir string, sizeGB int) error {
 	}
 
 	klog.Infof("btrfs: mounting %s on %s", imgPath, dir)
-	out, err := exec.Command("mount", "-o", "loop", imgPath, dir).CombinedOutput()
+	out, err := exec.Command("mount", "-t", "btrfs", "-o", "loop", imgPath, dir).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("mount: %s: %w", string(out), err)
 	}
