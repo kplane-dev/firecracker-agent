@@ -6,7 +6,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"syscall"
@@ -43,27 +42,21 @@ func main() {
 			fmt.Fprintf(os.Stderr, "guest-agent: accept: %v\n", err)
 			continue
 		}
-		f := os.NewFile(uintptr(connFd), "vsock-conn")
-		conn, err := net.FileConn(f)
-		f.Close()
-		if err != nil {
-			syscall.Close(connFd)
-			continue
-		}
-		go handleConn(conn)
+		go handleConn(connFd)
 	}
 }
 
-func handleConn(conn net.Conn) {
-	defer conn.Close()
+func handleConn(fd int) {
+	f := os.NewFile(uintptr(fd), "vsock-conn")
+	defer f.Close()
 
 	var req ExecRequest
-	if err := json.NewDecoder(conn).Decode(&req); err != nil {
-		json.NewEncoder(conn).Encode(ExecResponse{Stderr: err.Error(), ExitCode: 1})
+	if err := json.NewDecoder(f).Decode(&req); err != nil {
+		writeResponse(f, ExecResponse{Stderr: fmt.Sprintf("decode: %v", err), ExitCode: 1})
 		return
 	}
 	if len(req.Cmd) == 0 {
-		json.NewEncoder(conn).Encode(ExecResponse{Stderr: "empty command", ExitCode: 1})
+		writeResponse(f, ExecResponse{Stderr: "empty command", ExitCode: 1})
 		return
 	}
 
@@ -79,7 +72,11 @@ func handleConn(conn net.Conn) {
 			resp.Stderr = err.Error()
 		}
 	}
-	json.NewEncoder(conn).Encode(resp)
+	writeResponse(f, resp)
+}
+
+func writeResponse(f *os.File, resp ExecResponse) {
+	json.NewEncoder(f).Encode(resp)
 }
 
 // sockaddrVM mirrors struct sockaddr_vm from linux/vm_sockets.h.

@@ -2,7 +2,6 @@
 package vm
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -351,12 +350,24 @@ func vsockConnect(udsPath string, port uint32) (net.Conn, error) {
 		conn.Close()
 		return nil, err
 	}
-	reader := bufio.NewReader(conn)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("read response: %w", err)
+	// Read response byte-by-byte to avoid buffered reader consuming data
+	// past the newline (which belongs to the guest agent protocol).
+	var resp []byte
+	buf := make([]byte, 1)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("read response: %w", err)
+		}
+		if n > 0 {
+			resp = append(resp, buf[0])
+			if buf[0] == '\n' {
+				break
+			}
+		}
 	}
+	line := string(resp)
 	if !strings.HasPrefix(line, "OK ") {
 		conn.Close()
 		return nil, fmt.Errorf("vsock CONNECT failed: %s", strings.TrimSpace(line))
