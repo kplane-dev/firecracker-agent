@@ -1,0 +1,18 @@
+#!/bin/sh
+# Minimal init for Firecracker microVM (PID 1)
+
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /dev/shm
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+
+hostname sandbox
+ip link set lo up 2>/dev/null
+
+# Serial console — the host communicates via ttyS0.
+# Future: replace with vsock guest agent.
+exec setsid sh -l </dev/ttyS0 >/dev/ttyS0 2>&1

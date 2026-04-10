@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -9,10 +10,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
-
-	"encoding/json"
 
 	"github.com/kplane-dev/firecracker-agent/pkg/pool"
 	"github.com/kplane-dev/firecracker-agent/pkg/vm"
@@ -23,21 +23,23 @@ func main() {
 		listenAddr     string
 		firecrackerBin string
 		kernelPath     string
-		rootfsPath     string
+		imageDir       string
 		workDir        string
 		maxVMs         int
 		minWarm        int
+		warmImages     string
 		warmVCPUs      int
 		warmMemMiB     int
 	)
 
 	flag.StringVar(&listenAddr, "listen", ":8090", "HTTP API listen address")
-	flag.StringVar(&firecrackerBin, "firecracker-bin", "/opt/kata/bin/firecracker", "Path to firecracker binary")
-	flag.StringVar(&kernelPath, "kernel", "/opt/kata/share/kata-containers/vmlinux-6.18.15-186", "Path to guest kernel")
-	flag.StringVar(&rootfsPath, "rootfs", "/opt/kata/share/kata-containers/kata-alpine-3.22.initrd", "Path to rootfs/initrd")
+	flag.StringVar(&firecrackerBin, "firecracker-bin", "/opt/firecracker/bin/firecracker", "Path to firecracker binary")
+	flag.StringVar(&kernelPath, "kernel", "/opt/firecracker/vmlinux", "Path to guest kernel")
+	flag.StringVar(&imageDir, "image-dir", "/opt/firecracker/images", "Directory containing rootfs images (<name>.initrd)")
 	flag.StringVar(&workDir, "work-dir", "/var/lib/firecracker-agent", "Working directory for VM sockets and state")
 	flag.IntVar(&maxVMs, "max-vms", 10, "Maximum concurrent VMs")
-	flag.IntVar(&minWarm, "min-warm", 3, "Minimum warm pool size")
+	flag.IntVar(&minWarm, "min-warm", 2, "Minimum warm pool size per image")
+	flag.StringVar(&warmImages, "warm-images", "python,node", "Comma-separated list of images to keep warm")
 	flag.IntVar(&warmVCPUs, "warm-vcpus", 1, "vCPUs for warm pool VMs")
 	flag.IntVar(&warmMemMiB, "warm-memory", 128, "Memory (MiB) for warm pool VMs")
 	flag.Parse()
@@ -47,43 +49,47 @@ func main() {
 	cfg := vm.Config{
 		FirecrackerBin: firecrackerBin,
 		KernelPath:     kernelPath,
-		RootfsPath:     rootfsPath,
+		ImageDir:       imageDir,
 		WorkDir:        workDir,
 	}
 
-	p := pool.New(cfg, maxVMs, minWarm)
+	images := strings.Split(warmImages, ",")
+	p := pool.New(cfg, maxVMs, images, minWarm, warmVCPUs, warmMemMiB)
 
-	// Fill warm pool
-	log.Printf("filling warm pool (min=%d, vcpus=%d, mem=%dMiB)...", minWarm, warmVCPUs, warmMemMiB)
-	if err := p.Fill(warmVCPUs, warmMemMiB); err != nil {
+	log.Printf("filling warm pool (images=%v, min=%d per image, vcpus=%d, mem=%dMiB)...",
+		images, minWarm, warmVCPUs, warmMemMiB)
+	if err := p.Fill(); err != nil {
 		log.Printf("warn: warm pool fill error: %v", err)
 	}
 
-	// Start HTTP API (simple JSON API for testing; will be gRPC later)
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		warm, active, max := p.Status()
+		warmByImage, active, max := p.Status()
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"warm":   warm,
+			"warm":   warmByImage,
 			"active": active,
 			"max":    max,
 		})
 	})
 
 	mux.HandleFunc("/claim", func(w http.ResponseWriter, r *http.Request) {
+		image := r.URL.Query().Get("image")
+		if image == "" {
+			image = "python"
+		}
 		start := time.Now()
-		v, fromWarm, err := p.Claim(warmVCPUs, warmMemMiB)
+		v, fromWarm, err := p.Claim(image, warmVCPUs, warmMemMiB)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
-		elapsed := time.Since(start)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"vm_id":          v.ID,
+			"image":          v.Image,
 			"pid":            v.PID,
 			"from_warm_pool": fromWarm,
-			"claim_time_ms":  elapsed.Milliseconds(),
+			"claim_time_ms":  time.Since(start).Milliseconds(),
 		})
 	})
 
@@ -126,12 +132,10 @@ func main() {
 			return
 		}
 
-		elapsed := time.Since(start)
 		result := map[string]interface{}{
-			"source_vm_id":    vmID,
-			"branch_count":    len(branches),
-			"total_time_ms":   elapsed.Milliseconds(),
-			"branches":        []map[string]interface{}{},
+			"source_vm_id":  vmID,
+			"branch_count":  len(branches),
+			"total_time_ms": time.Since(start).Milliseconds(),
 		}
 		branchList := make([]map[string]interface{}, len(branches))
 		for i, b := range branches {
@@ -158,15 +162,14 @@ func main() {
 	server := &http.Server{Handler: mux}
 	go server.Serve(ln)
 
-	// Warm pool maintenance loop
+	// Warm pool maintenance
 	go func() {
 		for {
 			time.Sleep(5 * time.Second)
-			p.Fill(warmVCPUs, warmMemMiB)
+			p.Fill()
 		}
 	}()
 
-	// Wait for shutdown signal
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	<-ctx.Done()

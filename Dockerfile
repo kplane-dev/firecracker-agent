@@ -5,6 +5,14 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o /firecracker-agent ./cmd/agent
 
-FROM scratch
-COPY --from=builder /firecracker-agent /firecracker-agent
-ENTRYPOINT ["/firecracker-agent"]
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /firecracker-agent /usr/local/bin/firecracker-agent
+
+# Firecracker binary, kernel, and rootfs images are pre-built via `make all`
+# and expected in out/ at docker build time.
+COPY out/bin/firecracker /opt/firecracker/bin/firecracker
+COPY out/bin/vmlinux /opt/firecracker/vmlinux
+COPY out/images/ /opt/firecracker/images/
+
+ENTRYPOINT ["firecracker-agent"]

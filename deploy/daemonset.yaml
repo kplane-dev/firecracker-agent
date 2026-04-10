@@ -27,16 +27,15 @@ spec:
         image: ghcr.io/kplane-dev/firecracker-agent:latest
         args:
         - --listen=:8090
-        - --firecracker-bin=/host/opt/kata/bin/firecracker
-        - --kernel=/host/opt/kata/share/kata-containers/vmlinux-6.18.15-186
-        - --rootfs=/host/opt/kata/share/kata-containers/kata-alpine-3.22.initrd
+        - --firecracker-bin=/opt/firecracker/bin/firecracker
+        - --kernel=/opt/firecracker/vmlinux
+        - --image-dir=/opt/firecracker/images
         - --work-dir=/host/var/lib/firecracker-agent
         - --max-vms=10
-        - --min-warm=3
+        - --min-warm=2
+        - --warm-images=python,node
         ports:
         - name: api
-          containerPort: 8090
-        - name: health
           containerPort: 8090
         securityContext:
           privileged: true

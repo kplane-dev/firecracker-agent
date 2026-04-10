@@ -10,30 +10,37 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// Pool manages warm and active VMs.
+// Pool manages warm and active VMs, keyed by rootfs image.
 type Pool struct {
-	cfg     vm.Config
-	maxVMs  int
-	minWarm int
+	cfg        vm.Config
+	maxVMs     int
+	minWarm    int // per-image minimum
+	warmVCPUs  int
+	warmMemMiB int
+	warmImages []string
 
 	mu     sync.Mutex
-	warm   []*vm.VM
-	active map[string]*vm.VM
+	warm   map[string][]*vm.VM // image -> warm VMs
+	active map[string]*vm.VM   // vmID -> VM
 	nextID int
 }
 
 // New creates a new pool.
-func New(cfg vm.Config, maxVMs, minWarm int) *Pool {
+func New(cfg vm.Config, maxVMs int, warmImages []string, minWarm, warmVCPUs, warmMemMiB int) *Pool {
 	return &Pool{
-		cfg:    cfg,
-		maxVMs: maxVMs,
-		minWarm: minWarm,
-		active:  make(map[string]*vm.VM),
+		cfg:        cfg,
+		maxVMs:     maxVMs,
+		warmImages: warmImages,
+		minWarm:    minWarm,
+		warmVCPUs:  warmVCPUs,
+		warmMemMiB: warmMemMiB,
+		warm:       make(map[string][]*vm.VM),
+		active:     make(map[string]*vm.VM),
 	}
 }
 
-// Claim takes a VM from the warm pool or cold boots one.
-func (p *Pool) Claim(vcpus, memMiB int) (*vm.VM, bool, error) {
+// Claim takes a VM from the warm pool (matching image) or cold boots one.
+func (p *Pool) Claim(image string, vcpus, memMiB int) (*vm.VM, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -41,23 +48,23 @@ func (p *Pool) Claim(vcpus, memMiB int) (*vm.VM, bool, error) {
 		return nil, false, fmt.Errorf("max VMs reached (%d)", p.maxVMs)
 	}
 
-	// Try warm pool first
-	if len(p.warm) > 0 {
-		v := p.warm[len(p.warm)-1]
-		p.warm = p.warm[:len(p.warm)-1]
+	// Try warm pool for this image
+	if vms := p.warm[image]; len(vms) > 0 {
+		v := vms[len(vms)-1]
+		p.warm[image] = vms[:len(vms)-1]
 		p.active[v.ID] = v
-		klog.Infof("pool: claimed warm VM %s (%d warm remaining)", v.ID, len(p.warm))
+		klog.Infof("pool: claimed warm VM %s (image=%s, %d warm remaining)", v.ID, image, len(p.warm[image]))
 		return v, true, nil
 	}
 
 	// Cold boot
 	id := p.nextVMID()
-	v, err := vm.Boot(p.cfg, id, vcpus, memMiB)
+	v, err := vm.Boot(p.cfg, id, image, vcpus, memMiB)
 	if err != nil {
 		return nil, false, err
 	}
 	p.active[v.ID] = v
-	klog.Infof("pool: cold booted VM %s", v.ID)
+	klog.Infof("pool: cold booted VM %s (image=%s)", v.ID, image)
 	return v, false, nil
 }
 
@@ -75,36 +82,38 @@ func (p *Pool) Release(vmID string) error {
 	return v.Destroy()
 }
 
-// Fill pre-boots VMs to maintain the minimum warm count.
-func (p *Pool) Fill(vcpus, memMiB int) error {
-	p.mu.Lock()
-	needed := p.minWarm - len(p.warm)
-	total := len(p.warm) + len(p.active)
-	capacity := p.maxVMs - total
-	if needed > capacity {
-		needed = capacity
-	}
-	p.mu.Unlock()
-
-	for i := 0; i < needed; i++ {
-		id := func() string {
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			return p.nextVMID()
-		}()
-
-		start := time.Now()
-		v, err := vm.Boot(p.cfg, id, vcpus, memMiB)
-		if err != nil {
-			klog.Errorf("pool: failed to pre-boot VM: %v", err)
-			continue
-		}
-
+// Fill pre-boots VMs to maintain the minimum warm count per image.
+func (p *Pool) Fill() error {
+	for _, image := range p.warmImages {
 		p.mu.Lock()
-		p.warm = append(p.warm, v)
-		klog.Infof("pool: pre-booted warm VM %s in %v (%d/%d warm)",
-			v.ID, time.Since(start), len(p.warm), p.minWarm)
+		current := len(p.warm[image])
+		needed := p.minWarm - current
+		capacity := p.maxVMs - p.totalLocked()
+		if needed > capacity {
+			needed = capacity
+		}
 		p.mu.Unlock()
+
+		for i := 0; i < needed; i++ {
+			id := func() string {
+				p.mu.Lock()
+				defer p.mu.Unlock()
+				return p.nextVMID()
+			}()
+
+			start := time.Now()
+			v, err := vm.Boot(p.cfg, id, image, p.warmVCPUs, p.warmMemMiB)
+			if err != nil {
+				klog.Errorf("pool: failed to pre-boot %s VM: %v", image, err)
+				continue
+			}
+
+			p.mu.Lock()
+			p.warm[image] = append(p.warm[image], v)
+			klog.Infof("pool: pre-booted warm VM %s (image=%s) in %v (%d/%d warm)",
+				v.ID, image, time.Since(start), len(p.warm[image]), p.minWarm)
+			p.mu.Unlock()
+		}
 	}
 	return nil
 }
@@ -124,10 +133,14 @@ func (p *Pool) TrackActive(v *vm.VM) {
 }
 
 // Status returns pool stats.
-func (p *Pool) Status() (warm, active, max int) {
+func (p *Pool) Status() (warmByImage map[string]int, active, max int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.warm), len(p.active), p.maxVMs
+	warmByImage = make(map[string]int)
+	for image, vms := range p.warm {
+		warmByImage[image] = len(vms)
+	}
+	return warmByImage, len(p.active), p.maxVMs
 }
 
 // Shutdown destroys all VMs.
@@ -135,14 +148,24 @@ func (p *Pool) Shutdown() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for _, v := range p.warm {
-		v.Destroy()
+	for _, vms := range p.warm {
+		for _, v := range vms {
+			v.Destroy()
+		}
 	}
 	for _, v := range p.active {
 		v.Destroy()
 	}
 	p.warm = nil
 	p.active = nil
+}
+
+func (p *Pool) totalLocked() int {
+	total := len(p.active)
+	for _, vms := range p.warm {
+		total += len(vms)
+	}
+	return total
 }
 
 func (p *Pool) nextVMID() string {

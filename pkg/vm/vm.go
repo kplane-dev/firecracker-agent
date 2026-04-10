@@ -23,15 +23,21 @@ type Config struct {
 	FirecrackerBin string
 	// KernelPath is the path to the guest kernel (vmlinux).
 	KernelPath string
-	// RootfsPath is the path to the root filesystem (initrd or image).
-	RootfsPath string
+	// ImageDir is the directory containing rootfs images (<name>.initrd).
+	ImageDir string
 	// WorkDir is the directory for VM sockets and state.
 	WorkDir string
+}
+
+// ImagePath returns the full path to a rootfs image.
+func (c Config) ImagePath(image string) string {
+	return filepath.Join(c.ImageDir, image+".initrd")
 }
 
 // VM represents a running Firecracker microVM.
 type VM struct {
 	ID         string
+	Image      string
 	SocketPath string
 	IP         string
 	PID        int
@@ -43,7 +49,7 @@ type VM struct {
 }
 
 // Boot starts a new Firecracker VM and returns it.
-func Boot(cfg Config, id string, vcpus int, memMiB int) (*VM, error) {
+func Boot(cfg Config, id string, image string, vcpus int, memMiB int) (*VM, error) {
 	socketDir := filepath.Join(cfg.WorkDir, id)
 	if err := os.MkdirAll(socketDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create socket dir: %w", err)
@@ -63,6 +69,7 @@ func Boot(cfg Config, id string, vcpus int, memMiB int) (*VM, error) {
 
 	vm := &VM{
 		ID:         id,
+		Image:      image,
 		SocketPath: socketPath,
 		Config:     cfg,
 		cmd:        cmd,
@@ -87,7 +94,7 @@ func Boot(cfg Config, id string, vcpus int, memMiB int) (*VM, error) {
 	// Configure boot source
 	if err := vm.apiPut("/boot-source", map[string]interface{}{
 		"kernel_image_path": cfg.KernelPath,
-		"initrd_path":       cfg.RootfsPath,
+		"initrd_path":       cfg.ImagePath(image),
 		"boot_args":         "console=ttyS0 reboot=k panic=1 pci=off quiet",
 	}); err != nil {
 		cmd.Process.Kill()
@@ -171,7 +178,7 @@ func (vm *VM) Resume() error {
 }
 
 // Restore boots a new VM from a snapshot.
-func Restore(cfg Config, id string, snapshotDir string) (*VM, error) {
+func Restore(cfg Config, id string, image string, snapshotDir string) (*VM, error) {
 	socketDir := filepath.Join(cfg.WorkDir, id)
 	if err := os.MkdirAll(socketDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create socket dir: %w", err)
@@ -189,6 +196,7 @@ func Restore(cfg Config, id string, snapshotDir string) (*VM, error) {
 
 	vm := &VM{
 		ID:         id,
+		Image:      image,
 		SocketPath: socketPath,
 		Config:     cfg,
 		cmd:        cmd,
@@ -316,7 +324,7 @@ func Branch(cfg Config, source *VM, snapshotDir string, count int) ([]*VM, error
 
 		// Restore
 		restoreStart := time.Now()
-		vm, err := Restore(cfg, branchID, branchSnapDir)
+		vm, err := Restore(cfg, branchID, source.Image, branchSnapDir)
 		if err != nil {
 			return branches, fmt.Errorf("restore branch %d: %w", i, err)
 		}
