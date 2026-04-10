@@ -1,6 +1,6 @@
 .PHONY: all images agent guest-agent docker download-firecracker download-kernel download clean
 
-FC_VERSION ?= v1.12.0
+FC_VERSION ?= v1.15.1
 FC_ARCH    ?= x86_64
 IMAGE_TAG  ?= ghcr.io/kplane-dev/firecracker-agent:latest
 
@@ -20,7 +20,7 @@ download-firecracker:
 
 download-kernel:
 	mkdir -p out/bin
-	curl -fSL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/$(FC_ARCH)/vmlinux-5.10.233" \
+	curl -fSL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/$(FC_ARCH)/vmlinux-6.1.155" \
 		-o out/bin/vmlinux
 	@echo "-> out/bin/vmlinux"
 
