@@ -284,8 +284,11 @@ func Branch(cfg Config, source *VM, count int) ([]*VM, error) {
 	}
 	klog.Infof("branch: diff snapshot took %v, source resumed", snapDuration)
 
-	// Merge: reflink base + overlay dirty pages → complete mem
-	mergedMem := filepath.Join(snapshotDir, "mem-merged")
+	// Merge: reflink base (on btrfs) + overlay dirty pages from diff (on tmpfs).
+	// Output goes to btrfs so reflink works (tmpfs doesn't support reflink).
+	mergeDir := filepath.Join(cfg.WorkDir, "snapshots", source.ID)
+	os.MkdirAll(mergeDir, 0o755)
+	mergedMem := filepath.Join(mergeDir, "mem-merged")
 	mergeStart := time.Now()
 	if err := mergeSnapshot(
 		filepath.Join(source.BaselineDir, "mem"),
