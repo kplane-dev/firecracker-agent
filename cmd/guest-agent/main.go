@@ -70,6 +70,7 @@ func handleConn(fd int) {
 	}
 
 	cmd := exec.Command(req.Cmd[0], req.Cmd[1:]...)
+	cmd.Env = append(os.Environ(), "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	out, err := cmd.CombinedOutput()
 
 	resp := ExecResponse{Stdout: string(out)}
