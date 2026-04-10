@@ -43,7 +43,7 @@ func main() {
 	flag.IntVar(&minWarm, "min-warm", 2, "Minimum warm pool size per image")
 	flag.StringVar(&warmImages, "warm-images", "python,node", "Comma-separated list of images to keep warm")
 	flag.IntVar(&warmVCPUs, "warm-vcpus", 1, "vCPUs for warm pool VMs")
-	flag.IntVar(&warmMemMiB, "warm-memory", 128, "Memory (MiB) for warm pool VMs")
+	flag.IntVar(&warmMemMiB, "warm-memory", 192, "Memory (MiB) for warm pool VMs")
 	flag.Parse()
 
 	if err := btrfs.EnsureMount(workDir, btrfsSize); err != nil {
