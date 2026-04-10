@@ -8,12 +8,12 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/kplane-dev/firecracker-agent/pkg/btrfs"
 	"github.com/kplane-dev/firecracker-agent/pkg/pool"
 	"github.com/kplane-dev/firecracker-agent/pkg/vm"
 )
@@ -25,6 +25,7 @@ func main() {
 		kernelPath     string
 		imageDir       string
 		workDir        string
+		btrfsSize      int
 		maxVMs         int
 		minWarm        int
 		warmImages     string
@@ -37,6 +38,7 @@ func main() {
 	flag.StringVar(&kernelPath, "kernel", "/opt/firecracker/vmlinux", "Path to guest kernel")
 	flag.StringVar(&imageDir, "image-dir", "/opt/firecracker/images", "Directory containing rootfs images (<name>.initrd)")
 	flag.StringVar(&workDir, "work-dir", "/var/lib/firecracker-agent", "Working directory for VM sockets and state")
+	flag.IntVar(&btrfsSize, "btrfs-size", 50, "Size in GB for btrfs loopback image (0 to disable)")
 	flag.IntVar(&maxVMs, "max-vms", 10, "Maximum concurrent VMs")
 	flag.IntVar(&minWarm, "min-warm", 2, "Minimum warm pool size per image")
 	flag.StringVar(&warmImages, "warm-images", "python,node", "Comma-separated list of images to keep warm")
@@ -44,7 +46,9 @@ func main() {
 	flag.IntVar(&warmMemMiB, "warm-memory", 256, "Memory (MiB) for warm pool VMs")
 	flag.Parse()
 
-	os.MkdirAll(workDir, 0o755)
+	if err := btrfs.EnsureMount(workDir, btrfsSize); err != nil {
+		log.Printf("warn: btrfs setup failed (falling back to host fs): %v", err)
+	}
 
 	cfg := vm.Config{
 		FirecrackerBin: firecrackerBin,

@@ -6,7 +6,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /firecracker-agent ./cmd/agent
 
 FROM alpine:3.22
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates btrfs-progs coreutils
 COPY --from=builder /firecracker-agent /usr/local/bin/firecracker-agent
 
 # Firecracker binary, kernel, and rootfs images are pre-built via `make all`
