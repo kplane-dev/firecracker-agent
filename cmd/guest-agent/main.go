@@ -42,6 +42,8 @@ func main() {
 			fmt.Fprintf(os.Stderr, "guest-agent: accept: %v\n", err)
 			continue
 		}
+		// Ensure blocking mode — Go's runtime may set FDs non-blocking
+		syscall.SetNonblock(connFd, false)
 		go handleConn(connFd)
 	}
 }
