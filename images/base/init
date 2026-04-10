@@ -13,8 +13,13 @@ mount -t tmpfs tmpfs /run
 hostname sandbox
 ip link set lo up 2>/dev/null
 
+# Load vsock kernel modules if available
+modprobe vsock 2>/dev/null
+modprobe vmw_vsock_virtio_transport 2>/dev/null
+modprobe vhost_vsock 2>/dev/null
+
 # Start guest agent for vsock communication with the host
-/usr/local/bin/guest-agent &
+/usr/local/bin/guest-agent >/dev/console 2>&1 &
 
 # Serial console fallback
 exec setsid sh -l </dev/ttyS0 >/dev/ttyS0 2>&1
