@@ -2,7 +2,6 @@
 
 FC_VERSION ?= v1.12.0
 FC_ARCH    ?= x86_64
-KERNEL     ?= vmlinux.bin
 IMAGE_TAG  ?= ghcr.io/kplane-dev/firecracker-agent:latest
 
 all: download images agent
@@ -21,7 +20,7 @@ download-firecracker:
 
 download-kernel:
 	mkdir -p out/bin
-	curl -fSL "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/$(FC_ARCH)/kernels/$(KERNEL)" \
+	curl -fSL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$(FC_VERSION)/$(FC_ARCH)/vmlinux-5.10.233" \
 		-o out/bin/vmlinux
 	@echo "-> out/bin/vmlinux"
 
