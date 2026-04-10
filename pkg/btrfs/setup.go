@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 
 	"k8s.io/klog/v2"
@@ -58,6 +59,20 @@ func EnsureMount(dir string, sizeGB int) error {
 	}
 
 	klog.Infof("btrfs: %s is now on btrfs (reflink enabled)", dir)
+
+	// Mount tmpfs for snapshot memory files (RAM-speed writes instead of disk).
+	// Branch snapshots are ephemeral — only needed until branches are restored.
+	snapRAM := filepath.Join(dir, "snap-ram")
+	if err := os.MkdirAll(snapRAM, 0o755); err != nil {
+		return fmt.Errorf("mkdir snap-ram: %w", err)
+	}
+	out, err = exec.Command("mount", "-t", "tmpfs", "-o", "size=1G", "tmpfs", snapRAM).CombinedOutput()
+	if err != nil {
+		klog.Warningf("btrfs: tmpfs mount for snapshots failed: %s: %v", string(out), err)
+	} else {
+		klog.Infof("btrfs: tmpfs mounted at %s for fast snapshots", snapRAM)
+	}
+
 	return nil
 }
 

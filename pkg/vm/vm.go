@@ -265,7 +265,12 @@ func Branch(cfg Config, source *VM, count int) ([]*VM, error) {
 		return branchFull(cfg, source, count)
 	}
 
-	snapshotDir := filepath.Join(cfg.WorkDir, "snapshots", source.ID)
+	// Write diff snapshot to tmpfs (snap-ram) for RAM-speed writes.
+	snapBase := filepath.Join(cfg.WorkDir, "snap-ram")
+	if _, err := os.Stat(snapBase); err != nil {
+		snapBase = filepath.Join(cfg.WorkDir, "snapshots")
+	}
+	snapshotDir := filepath.Join(snapBase, source.ID)
 
 	// Diff snapshot — only pages dirtied since baseline
 	start := time.Now()
@@ -356,7 +361,11 @@ func Branch(cfg Config, source *VM, count int) ([]*VM, error) {
 
 // branchFull is the fallback when no baseline exists (full snapshot).
 func branchFull(cfg Config, source *VM, count int) ([]*VM, error) {
-	snapshotDir := filepath.Join(cfg.WorkDir, "snapshots", source.ID)
+	snapBase := filepath.Join(cfg.WorkDir, "snap-ram")
+	if _, err := os.Stat(snapBase); err != nil {
+		snapBase = filepath.Join(cfg.WorkDir, "snapshots")
+	}
+	snapshotDir := filepath.Join(snapBase, source.ID)
 
 	start := time.Now()
 	if err := source.Snapshot(snapshotDir, false); err != nil {
