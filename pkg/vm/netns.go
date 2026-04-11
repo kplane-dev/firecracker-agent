@@ -94,9 +94,12 @@ func (ns *NetNS) DialTCP(addr string) (syscall.RawConn, error) {
 	return nil, fmt.Errorf("use ExecInNS instead")
 }
 
-// exec runs a command inside the namespace.
+// exec runs a command inside the namespace using the host's binaries.
+// We enter the host mount namespace (for binaries) and the target net namespace.
 func (ns *NetNS) exec(args ...string) error {
-	cmdArgs := append([]string{fmt.Sprintf("--net=%s", ns.NSPath), "--"}, args...)
+	// Enter host mount (for /usr/sbin/ip etc) + our netns
+	cmdArgs := []string{"--target", "1", "--mount", fmt.Sprintf("--net=%s", ns.NSPath), "--"}
+	cmdArgs = append(cmdArgs, args...)
 	out, err := exec.Command("nsenter", cmdArgs...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s: %s: %w", args[0], strings.TrimSpace(string(out)), err)
