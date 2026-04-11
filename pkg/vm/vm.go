@@ -377,7 +377,7 @@ func (vm *VM) Resume() error {
 	})
 }
 
-// WaitReady polls the vsock guest agent until it responds or the timeout expires.
+// WaitReady polls the guest agent until it responds or the timeout expires.
 func (vm *VM) WaitReady(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -385,26 +385,46 @@ func (vm *VM) WaitReady(timeout time.Duration) error {
 		if err == nil {
 			return nil
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 	return fmt.Errorf("guest agent not ready after %v", timeout)
 }
 
-// Exec runs a command inside the VM via the vsock guest agent.
-// Retries the vsock connect briefly to handle post-restore transport resets.
+// Exec runs a command inside the VM via the guest agent.
+// Uses TCP over the TAP network (survives snapshot restore with no reset).
+// Falls back to vsock if no network is configured.
 func (vm *VM) Exec(cmd []string, timeout time.Duration) (stdout, stderr string, exitCode int, err error) {
 	var conn net.Conn
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for {
-		conn, err = vsockConnect(vm.VsockPath, 1024)
-		if err == nil {
-			break
+
+	if vm.Net.GuestIP != "" {
+		// TCP path — no transport reset after restore
+		addr := fmt.Sprintf("%s:1024", vm.Net.GuestIP)
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for {
+			conn, err = net.DialTimeout("tcp", addr, 200*time.Millisecond)
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				return "", "", -1, fmt.Errorf("tcp connect %s: %w", addr, err)
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		if time.Now().After(deadline) {
-			return "", "", -1, fmt.Errorf("vsock connect: %w", err)
+	} else {
+		// Vsock fallback
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for {
+			conn, err = vsockConnect(vm.VsockPath, 1024)
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				return "", "", -1, fmt.Errorf("vsock connect: %w", err)
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
+
 	if timeout > 0 {
 		conn.SetDeadline(time.Now().Add(timeout))
 	}

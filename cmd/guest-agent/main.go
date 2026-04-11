@@ -1,11 +1,12 @@
 //go:build linux
 
-// guest-agent runs inside Firecracker VMs and accepts exec commands via vsock.
+// guest-agent runs inside Firecracker VMs and accepts exec commands via TCP and vsock.
 package main
 
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"syscall"
@@ -14,11 +15,12 @@ import (
 )
 
 const (
-	agentPort    = 1024
+	tcpPort      = 1024
+	vsockPort    = 1024
 	afVsock      = 40
 	vmaddrCIDAny = 0xFFFFFFFF
-	maxReqSize   = 1 << 20 // 1MB max request
-	readTimeout  = 30       // seconds
+	maxReqSize   = 1 << 20
+	readTimeout  = 30
 )
 
 type ExecRequest struct {
@@ -32,47 +34,75 @@ type ExecResponse struct {
 }
 
 func main() {
-	listenFd, err := vsockListen(agentPort)
+	// TCP listener — survives snapshot restore with no reset
+	go func() {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", tcpPort))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "guest-agent: tcp listen: %v\n", err)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "guest-agent: listening on tcp port %d\n", tcpPort)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				continue
+			}
+			go handleTCPConn(conn)
+		}
+	}()
+
+	// Vsock listener — fallback for VMs without network
+	listenFd, err := vsockListen(vsockPort)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "guest-agent: listen vsock port %d: %v\n", agentPort, err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "guest-agent: vsock listen: %v (tcp-only mode)\n", err)
+		// Block forever if vsock fails — TCP is the primary
+		select {}
 	}
-	fmt.Fprintf(os.Stderr, "guest-agent: listening on vsock port %d\n", agentPort)
+	fmt.Fprintf(os.Stderr, "guest-agent: listening on vsock port %d\n", vsockPort)
 
 	for {
 		connFd, _, errno := syscall.Syscall(syscall.SYS_ACCEPT, uintptr(listenFd), 0, 0)
 		if errno != 0 {
-			fmt.Fprintf(os.Stderr, "guest-agent: accept: %v\n", errno)
-			time.Sleep(100 * time.Millisecond) // backoff on repeated errors
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		syscall.SetNonblock(int(connFd), false)
-		go handleConn(int(connFd))
+		go handleVsockConn(int(connFd))
 	}
 }
 
-func handleConn(fd int) {
+func handleTCPConn(conn net.Conn) {
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+	var req ExecRequest
+	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+		json.NewEncoder(conn).Encode(ExecResponse{Stderr: err.Error(), ExitCode: 1})
+		return
+	}
+	resp := execCmd(req)
+	json.NewEncoder(conn).Encode(resp)
+}
+
+func handleVsockConn(fd int) {
 	defer syscall.Close(fd)
 
-	// Set read timeout to prevent goroutine leak from idle connections
 	tv := syscall.Timeval{Sec: readTimeout}
 	syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
 
-	// Read request — loop to handle partial reads
 	buf := make([]byte, 0, 4096)
 	tmp := make([]byte, 4096)
 	for len(buf) < maxReqSize {
 		n, err := syscall.Read(fd, tmp)
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
-			// Check if we have a complete JSON object (ends with } or }\n)
 			if len(buf) > 0 && (buf[len(buf)-1] == '}' || (len(buf) > 1 && buf[len(buf)-2] == '}' && buf[len(buf)-1] == '\n')) {
 				break
 			}
 		}
 		if err != nil {
 			if len(buf) > 0 {
-				break // try to parse what we have
+				break
 			}
 			writeJSON(fd, ExecResponse{Stderr: fmt.Sprintf("read: %v", err), ExitCode: 1})
 			return
@@ -84,9 +114,13 @@ func handleConn(fd int) {
 		writeJSON(fd, ExecResponse{Stderr: fmt.Sprintf("decode: %v", err), ExitCode: 1})
 		return
 	}
+	resp := execCmd(req)
+	writeJSON(fd, resp)
+}
+
+func execCmd(req ExecRequest) ExecResponse {
 	if len(req.Cmd) == 0 {
-		writeJSON(fd, ExecResponse{Stderr: "empty command", ExitCode: 1})
-		return
+		return ExecResponse{Stderr: "empty command", ExitCode: 1}
 	}
 
 	cmd := exec.Command(req.Cmd[0], req.Cmd[1:]...)
@@ -102,7 +136,7 @@ func handleConn(fd int) {
 			resp.Stderr = err.Error()
 		}
 	}
-	writeJSON(fd, resp)
+	return resp
 }
 
 func writeJSON(fd int, v interface{}) {

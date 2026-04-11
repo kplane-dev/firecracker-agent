@@ -76,10 +76,7 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 
 	// Guest network is already configured in the baseline snapshot (10.0.0.2/30).
 	// The new TAP (via network_overrides) gets 10.0.0.1 with scope link.
-	// No per-restore vsock exec needed.
-
-	// Warm vsock in background (absorbs transport reset without blocking claim)
-	go v.WaitReady(2 * time.Second)
+	// Exec uses TCP over the TAP — no vsock transport reset, no warmup needed.
 
 	p.mu.Lock()
 	p.active[v.ID] = v
