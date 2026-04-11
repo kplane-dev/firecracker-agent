@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -37,24 +38,7 @@ type ExecResponse struct {
 var runtimeWorker *worker
 
 func main() {
-	// Detect runtime and start persistent worker
-	if _, err := exec.LookPath("node"); err == nil {
-		w, err := startNodeWorker()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "guest-agent: node worker failed: %v\n", err)
-		} else {
-			runtimeWorker = w
-			fmt.Fprintf(os.Stderr, "guest-agent: node worker started (persistent)\n")
-		}
-	} else if _, err := exec.LookPath("python3"); err == nil {
-		w, err := startPythonWorker()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "guest-agent: python worker failed: %v\n", err)
-		} else {
-			runtimeWorker = w
-			fmt.Fprintf(os.Stderr, "guest-agent: python worker started (persistent)\n")
-		}
-	}
+	// Worker started lazily on first eval request (survives snapshot restore)
 
 	// TCP listener — survives snapshot restore with no reset
 	go func() {
@@ -140,10 +124,37 @@ func handleVsockConn(fd int) {
 	writeJSON(fd, resp)
 }
 
+var workerMu sync.Mutex
+
+func ensureWorker() {
+	workerMu.Lock()
+	defer workerMu.Unlock()
+	if runtimeWorker != nil {
+		return
+	}
+	// Lazy start — handles both first boot and post-restore
+	if _, err := exec.LookPath("node"); err == nil {
+		w, err := startNodeWorker()
+		if err == nil {
+			runtimeWorker = w
+			fmt.Fprintf(os.Stderr, "guest-agent: node worker started (lazy)\n")
+		}
+	} else if _, err := exec.LookPath("python3"); err == nil {
+		w, err := startPythonWorker()
+		if err == nil {
+			runtimeWorker = w
+			fmt.Fprintf(os.Stderr, "guest-agent: python worker started (lazy)\n")
+		}
+	}
+}
+
 func execCmd(req ExecRequest) ExecResponse {
 	// Eval path: send code to the persistent runtime worker
-	if req.Eval != "" && runtimeWorker != nil {
-		return runtimeWorker.eval(req.Eval)
+	if req.Eval != "" {
+		ensureWorker()
+		if runtimeWorker != nil {
+			return runtimeWorker.eval(req.Eval)
+		}
 	}
 
 	// Shell path: spawn a process
