@@ -286,13 +286,14 @@ func SetupNAT() error {
 	return hostExec("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "10.0.0.0/16", "-j", "MASQUERADE")
 }
 
-// ConfigureGuestNetwork sets up the network inside the VM via vsock exec.
+// ConfigureGuestNetwork sets up the network inside the VM.
+// Uses vsock (not TCP) because TCP requires the network to be configured first.
 func (vm *VM) ConfigureGuestNetwork(net Network) error {
 	cmd := fmt.Sprintf(
 		"ip addr flush dev eth0 2>/dev/null; ip addr add %s/30 dev eth0 && ip link set eth0 up && ip route add default via %s && echo 'nameserver 8.8.8.8' > /etc/resolv.conf",
 		net.GuestIP, net.HostIP,
 	)
-	_, stderr, exitCode, err := vm.Exec([]string{"/bin/sh", "-c", cmd}, 5*time.Second)
+	_, stderr, exitCode, err := vm.execVsock([]string{"/bin/sh", "-c", cmd}, 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("configure guest network: %w", err)
 	}
@@ -375,16 +376,53 @@ func (vm *VM) Resume() error {
 }
 
 // WaitReady polls the guest agent until it responds or the timeout expires.
+// Uses vsock (works before network is configured).
 func (vm *VM) WaitReady(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		_, _, _, err := vm.Exec([]string{"/bin/true"}, 2*time.Second)
+		_, _, _, err := vm.execVsock([]string{"/bin/true"}, 2*time.Second)
 		if err == nil {
 			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	return fmt.Errorf("guest agent not ready after %v", timeout)
+}
+
+// execVsock runs a command via the vsock guest agent (for network config before TCP is available).
+func (vm *VM) execVsock(cmd []string, timeout time.Duration) (stdout, stderr string, exitCode int, err error) {
+	var conn net.Conn
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		conn, err = vsockConnect(vm.VsockPath, 1024)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			return "", "", -1, fmt.Errorf("vsock connect: %w", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if timeout > 0 {
+		conn.SetDeadline(time.Now().Add(timeout))
+	}
+	defer conn.Close()
+
+	req := struct {
+		Cmd []string `json:"cmd"`
+	}{Cmd: cmd}
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return "", "", -1, fmt.Errorf("send: %w", err)
+	}
+	var resp struct {
+		Stdout   string `json:"stdout"`
+		Stderr   string `json:"stderr"`
+		ExitCode int    `json:"exit_code"`
+	}
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return "", "", -1, fmt.Errorf("recv: %w", err)
+	}
+	return resp.Stdout, resp.Stderr, resp.ExitCode, nil
 }
 
 // Exec runs a command inside the VM via the guest agent.
