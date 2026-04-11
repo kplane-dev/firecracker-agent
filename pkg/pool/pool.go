@@ -78,8 +78,8 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 	// The new TAP (via network_overrides) gets 10.0.0.1 with scope link.
 	// No per-restore vsock exec needed.
 
-	// Pre-warm vsock connection (absorbs transport reset latency)
-	v.WaitReady(1 * time.Second)
+	// Warm vsock in background (absorbs transport reset without blocking claim)
+	go v.WaitReady(2 * time.Second)
 
 	p.mu.Lock()
 	p.active[v.ID] = v
