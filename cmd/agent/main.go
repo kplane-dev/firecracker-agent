@@ -169,6 +169,51 @@ func main() {
 		json.NewEncoder(w).Encode(result)
 	})
 
+	mux.HandleFunc("/ssh/enable", func(w http.ResponseWriter, r *http.Request) {
+		vmID := r.URL.Query().Get("vm_id")
+		pubKey := r.URL.Query().Get("key")
+		if vmID == "" || pubKey == "" {
+			http.Error(w, "vm_id and key required", http.StatusBadRequest)
+			return
+		}
+		v := p.GetActive(vmID)
+		if v == nil {
+			http.Error(w, "VM not found", http.StatusNotFound)
+			return
+		}
+		if err := v.EnableSSH(pubKey); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"vm_id":   vmID,
+			"ssh_ip":  v.Net.GuestIP,
+			"ssh_port": 22,
+			"status":  "enabled",
+		})
+	})
+
+	mux.HandleFunc("/ssh/disable", func(w http.ResponseWriter, r *http.Request) {
+		vmID := r.URL.Query().Get("vm_id")
+		if vmID == "" {
+			http.Error(w, "vm_id required", http.StatusBadRequest)
+			return
+		}
+		v := p.GetActive(vmID)
+		if v == nil {
+			http.Error(w, "VM not found", http.StatusNotFound)
+			return
+		}
+		if err := v.DisableSSH(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"vm_id":  vmID,
+			"status": "disabled",
+		})
+	})
+
 	mux.HandleFunc("/exec", func(w http.ResponseWriter, r *http.Request) {
 		vmID := r.URL.Query().Get("vm_id")
 		cmdStr := r.URL.Query().Get("cmd")

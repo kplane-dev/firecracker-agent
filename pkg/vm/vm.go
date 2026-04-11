@@ -293,6 +293,38 @@ func (vm *VM) ConfigureGuestNetwork(net Network) error {
 	return nil
 }
 
+// EnableSSH generates a host key, injects the user's public key, and starts dropbear.
+func (vm *VM) EnableSSH(authorizedKey string) error {
+	cmds := []string{
+		// Generate unique host key for this VM
+		"dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null",
+		// Inject user's public key
+		fmt.Sprintf("echo '%s' > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys", authorizedKey),
+		// Start dropbear (foreground daemon, password auth disabled)
+		"dropbear -R -s -g -p 22",
+	}
+	cmd := strings.Join(cmds, " && ")
+	_, stderr, exitCode, err := vm.Exec([]string{"/bin/sh", "-c", cmd}, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("enable ssh: %w", err)
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("enable ssh: exit %d: %s", exitCode, stderr)
+	}
+	klog.Infof("vm %s: SSH enabled (dropbear listening on :22)", vm.ID)
+	return nil
+}
+
+// DisableSSH stops the dropbear daemon.
+func (vm *VM) DisableSSH() error {
+	_, _, _, err := vm.Exec([]string{"/bin/sh", "-c", "killall dropbear 2>/dev/null; rm -f /root/.ssh/authorized_keys"}, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("disable ssh: %w", err)
+	}
+	klog.Infof("vm %s: SSH disabled", vm.ID)
+	return nil
+}
+
 // Snapshot pauses the VM and saves its state.
 func (vm *VM) Snapshot(snapshotDir string, diff bool) error {
 	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
