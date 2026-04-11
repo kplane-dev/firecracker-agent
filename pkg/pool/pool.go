@@ -63,10 +63,12 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 	net, _ := p.allocateNetworkLocked(id)
 	p.mu.Unlock()
 
-	// Restore from baseline snapshot (~70ms)
+	// Prefetch baseline memory into page cache (eliminates page faults during restore)
+	memPath := fmt.Sprintf("%s/mem", bl.vmstateDir)
+	vm.PrefetchFile(memPath)
+
 	start := time.Now()
 	vmstatePath := fmt.Sprintf("%s/vmstate", bl.vmstateDir)
-	memPath := fmt.Sprintf("%s/mem", bl.vmstateDir)
 
 	v, err := vm.Restore(p.cfg, id, image, vmstatePath, memPath, net)
 	if err != nil {

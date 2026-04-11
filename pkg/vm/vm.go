@@ -898,6 +898,22 @@ func vsockConnect(udsPath string, port uint32) (net.Conn, error) {
 	return conn, nil
 }
 
+// PrefetchFile reads a file into the kernel page cache to avoid page faults during mmap.
+func PrefetchFile(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	buf := make([]byte, 256*1024) // 256KB read buffer
+	for {
+		_, err := f.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+}
+
 func newAPIClient(socketPath string) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
