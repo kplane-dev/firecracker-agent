@@ -3,33 +3,22 @@ package vm
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
-	"runtime"
 	"strings"
-	"syscall"
 
 	"k8s.io/klog/v2"
 )
 
-const (
-	sysSetns    = 308 // SYS_SETNS on x86_64
-	cloneNewnet = 0x40000000
-)
-
 // NetNS is a network namespace with a TAP device ready for a Firecracker VM.
-// The namespace is held open by a sentinel process. All VMs in the namespace
-// share the same guest IP (10.0.0.2) — each namespace is isolated.
+// Held open by a sentinel process. All VMs share guest IP 10.0.0.2.
 type NetNS struct {
-	SentinelPID int    // PID of the sentinel process holding the namespace
+	SentinelPID int
 	NSPath      string // /proc/<pid>/ns/net
 	cmd         *exec.Cmd
 }
 
 // CreateNetNS creates a new network namespace with a TAP device configured.
-// The sentinel holds the namespace open. ~3-5ms total.
 func CreateNetNS() (*NetNS, error) {
-	// Create an anonymous netns via unshare + sentinel
 	cmd := exec.Command("unshare", "--net", "sleep", "infinity")
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start sentinel: %w", err)
@@ -41,26 +30,22 @@ func CreateNetNS() (*NetNS, error) {
 		cmd:         cmd,
 	}
 
-	// Configure TAP inside the namespace (same name/IP as the baseline snapshot expects)
-	if err := ns.exec("ip", "link", "set", "lo", "up"); err != nil {
+	if err := ns.hostExec("ip", "link", "set", "lo", "up"); err != nil {
 		ns.Destroy()
 		return nil, fmt.Errorf("lo up: %w", err)
 	}
-	if err := ns.exec("ip", "tuntap", "add", "name", "vmtap0", "mode", "tap"); err != nil {
+	if err := ns.hostExec("ip", "tuntap", "add", "name", "vmtap0", "mode", "tap"); err != nil {
 		ns.Destroy()
 		return nil, fmt.Errorf("create tap: %w", err)
 	}
-	if err := ns.exec("ip", "addr", "add", "10.0.0.1/30", "dev", "vmtap0"); err != nil {
+	if err := ns.hostExec("ip", "addr", "add", "10.0.0.1/30", "dev", "vmtap0"); err != nil {
 		ns.Destroy()
 		return nil, fmt.Errorf("set ip: %w", err)
 	}
-	if err := ns.exec("ip", "link", "set", "vmtap0", "up"); err != nil {
+	if err := ns.hostExec("ip", "link", "set", "vmtap0", "up"); err != nil {
 		ns.Destroy()
 		return nil, fmt.Errorf("link up: %w", err)
 	}
-
-	// Enable IP forwarding and NAT for internet access
-	ns.exec("sysctl", "-w", "net.ipv4.ip_forward=1")
 
 	return ns, nil
 }
@@ -87,17 +72,8 @@ func (ns *NetNS) StartFirecracker(firecrackerBin, socketPath, workDir string) (*
 	return cmd, nil
 }
 
-// DialTCP connects to the guest TCP port from inside this namespace.
-// Uses setns to enter the namespace on the current OS thread.
-func (ns *NetNS) DialTCP(addr string) (syscall.RawConn, error) {
-	// This is handled by ExecInNS which does the setns dance
-	return nil, fmt.Errorf("use ExecInNS instead")
-}
-
-// exec runs a command inside the namespace using the host's binaries.
-// We enter the host mount namespace (for binaries) and the target net namespace.
-func (ns *NetNS) exec(args ...string) error {
-	// Enter host mount (for /usr/sbin/ip etc) + our netns
+// hostExec runs a command inside the namespace using the host's binaries.
+func (ns *NetNS) hostExec(args ...string) error {
 	cmdArgs := []string{"--target", "1", "--mount", fmt.Sprintf("--net=%s", ns.NSPath), "--"}
 	cmdArgs = append(cmdArgs, args...)
 	out, err := exec.Command("nsenter", cmdArgs...).CombinedOutput()
@@ -107,151 +83,52 @@ func (ns *NetNS) exec(args ...string) error {
 	return nil
 }
 
-// ExecInNS enters the network namespace, dials TCP to the guest agent,
-// sends a command, and returns the result. Uses LockOSThread to safely
-// switch the current thread's network namespace.
+// ExecInNS runs a command in the guest via the network namespace.
+// Uses nsenter as a subprocess to avoid corrupting Go runtime's network state.
 func ExecInNS(nsPath, guestAddr string, req interface{}, resp interface{}) error {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	// Save current namespace
-	origNS, err := os.Open("/proc/self/ns/net")
+	reqJSON, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("open current netns: %w", err)
+		return fmt.Errorf("marshal: %w", err)
 	}
-	defer origNS.Close()
 
-	// Enter target namespace
-	targetNS, err := os.Open(nsPath)
+	// nc sends the JSON and reads the response via the namespace's TCP.
+	host, port, _ := strings.Cut(guestAddr, ":")
+	script := fmt.Sprintf(
+		`printf '%%s\n' '%s' | nc -w 5 %s %s`,
+		strings.ReplaceAll(string(reqJSON), "'", "'\\''"),
+		host, port,
+	)
+
+	cmd := exec.Command("nsenter", fmt.Sprintf("--net=%s", nsPath), "--", "sh", "-c", script)
+	out, err := cmd.Output()
 	if err != nil {
-		return fmt.Errorf("open target netns %s: %w", nsPath, err)
+		return fmt.Errorf("nsenter exec: %w", err)
 	}
-	defer targetNS.Close()
-
-	if _, _, errno := syscall.Syscall(sysSetns, targetNS.Fd(), uintptr(cloneNewnet), 0); errno != 0 {
-		return fmt.Errorf("setns to target: %w", errno)
+	if len(out) == 0 {
+		return fmt.Errorf("empty response from guest")
 	}
-
-	// Restore original namespace on exit
-	defer func() {
-		syscall.Syscall(sysSetns, origNS.Fd(), uintptr(cloneNewnet), 0)
-	}()
-
-	// Now we're in the target namespace — TCP to guest
-	conn, err := dialTCPRaw(guestAddr)
-	if err != nil {
-		return fmt.Errorf("tcp connect: %w", err)
-	}
-	defer conn.Close()
-
-	// Use raw fd for read/write (Go's net.Conn doesn't work well after setns)
-	encoder := json.NewEncoder(conn)
-	decoder := json.NewDecoder(conn)
-
-	if err := encoder.Encode(req); err != nil {
-		return fmt.Errorf("send: %w", err)
-	}
-	if err := decoder.Decode(resp); err != nil {
-		return fmt.Errorf("recv: %w", err)
-	}
-	return nil
+	return json.Unmarshal(out, resp)
 }
 
-// dialTCPRaw creates a TCP connection using raw syscalls (works after setns).
-func dialTCPRaw(addr string) (*os.File, error) {
-	// Parse addr "10.0.0.2:1024"
-	host, portStr, _ := strings.Cut(addr, ":")
-	var port int
-	fmt.Sscanf(portStr, "%d", &port)
-
-	// Parse IP
-	var ip [4]byte
-	fmt.Sscanf(host, "%d.%d.%d.%d", &ip[0], &ip[1], &ip[2], &ip[3])
-
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
-	if err != nil {
-		return nil, err
-	}
-
-	sa := &syscall.SockaddrInet4{
-		Port: port,
-		Addr: ip,
-	}
-	if err := syscall.Connect(fd, sa); err != nil {
-		syscall.Close(fd)
-		return nil, err
-	}
-
-	return os.NewFile(uintptr(fd), "tcp"), nil
-}
-
-// EvalInNS enters the namespace and POSTs code to the eval server (port 1025).
-// The eval server is an HTTP server running inside the VM (captured in snapshot).
+// EvalInNS sends code to the eval server (port 1025) via the namespace.
 func EvalInNS(nsPath, addr, code string, resp interface{}) error {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	host, port, _ := strings.Cut(addr, ":")
 
-	origNS, err := os.Open("/proc/self/ns/net")
+	script := fmt.Sprintf(
+		`wget -qO- --post-data='%s' http://%s:%s/ 2>/dev/null`,
+		strings.ReplaceAll(code, "'", "'\\''"),
+		host, port,
+	)
+
+	cmd := exec.Command("nsenter", fmt.Sprintf("--net=%s", nsPath), "--", "sh", "-c", script)
+	out, err := cmd.Output()
 	if err != nil {
-		return fmt.Errorf("open current netns: %w", err)
+		return fmt.Errorf("eval: %w", err)
 	}
-	defer origNS.Close()
-
-	targetNS, err := os.Open(nsPath)
-	if err != nil {
-		return fmt.Errorf("open target netns: %w", err)
+	if len(out) == 0 {
+		return fmt.Errorf("empty eval response")
 	}
-	defer targetNS.Close()
-
-	if _, _, errno := syscall.Syscall(sysSetns, targetNS.Fd(), uintptr(cloneNewnet), 0); errno != 0 {
-		return fmt.Errorf("setns: %w", errno)
-	}
-	defer func() {
-		syscall.Syscall(sysSetns, origNS.Fd(), uintptr(cloneNewnet), 0)
-	}()
-
-	// HTTP POST to the eval server
-	conn, err := dialTCPRaw(addr)
-	if err != nil {
-		return fmt.Errorf("connect: %w", err)
-	}
-	defer conn.Close()
-
-	// Write HTTP request
-	reqBody := []byte(code)
-	header := fmt.Sprintf("POST / HTTP/1.0\r\nContent-Length: %d\r\nContent-Type: text/plain\r\n\r\n", len(reqBody))
-	conn.Write([]byte(header))
-	conn.Write(reqBody)
-
-	// Read response (simple HTTP/1.0 — read until EOF)
-	var buf [65536]byte
-	var response []byte
-	for {
-		n, err := conn.Read(buf[:])
-		if n > 0 {
-			response = append(response, buf[:n]...)
-		}
-		if err != nil {
-			break
-		}
-	}
-
-	// Parse HTTP response — find body after \r\n\r\n
-	body := response
-	if idx := findHTTPBody(response); idx >= 0 {
-		body = response[idx:]
-	}
-
-	return json.Unmarshal(body, resp)
-}
-
-func findHTTPBody(data []byte) int {
-	for i := 0; i+3 < len(data); i++ {
-		if data[i] == '\r' && data[i+1] == '\n' && data[i+2] == '\r' && data[i+3] == '\n' {
-			return i + 4
-		}
-	}
-	return -1
+	return json.Unmarshal(out, resp)
 }
 
 func init() {
