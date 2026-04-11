@@ -279,7 +279,7 @@ func SetupNAT() error {
 // ConfigureGuestNetwork sets up the network inside the VM via vsock exec.
 func (vm *VM) ConfigureGuestNetwork(net Network) error {
 	cmd := fmt.Sprintf(
-		"ip addr flush dev eth0 2>/dev/null; ip addr add %s/30 dev eth0 && ip link set eth0 up && ip route add default via %s",
+		"ip addr flush dev eth0 2>/dev/null; ip addr add %s/30 dev eth0 && ip link set eth0 up && ip route add default via %s && echo 'nameserver 8.8.8.8' > /etc/resolv.conf",
 		net.GuestIP, net.HostIP,
 	)
 	_, stderr, exitCode, err := vm.Exec([]string{"/bin/sh", "-c", cmd}, 5*time.Second)
