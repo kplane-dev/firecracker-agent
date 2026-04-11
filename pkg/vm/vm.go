@@ -447,31 +447,42 @@ func (vm *VM) execVsock(cmd []string, timeout time.Duration) (stdout, stderr str
 	return resp.Stdout, resp.Stderr, resp.ExitCode, nil
 }
 
-// ExecEval sends code to the persistent runtime worker inside the VM.
+// ExecEval sends code to the runtime eval server inside the VM.
+// The eval server (port 1025) is a persistent Node.js/Python HTTP server
+// captured in the snapshot — survives restore, no startup cost.
 func (vm *VM) ExecEval(code string, timeout time.Duration) (stdout, stderr string, exitCode int, err error) {
 	if vm.NS != nil {
-		req := struct {
-			Eval string `json:"eval"`
-		}{Eval: code}
+		// Try the HTTP eval server on port 1025 (pre-started in snapshot)
 		var resp struct {
 			Stdout   string `json:"stdout"`
 			Stderr   string `json:"stderr"`
 			ExitCode int    `json:"exit_code"`
 		}
+
 		deadline := time.Now().Add(500 * time.Millisecond)
 		for {
-			err = ExecInNS(vm.NS.NSPath, "10.0.0.2:1024", req, &resp)
+			err = EvalInNS(vm.NS.NSPath, "10.0.0.2:1025", code, &resp)
 			if err == nil {
 				return resp.Stdout, resp.Stderr, resp.ExitCode, nil
 			}
 			if time.Now().After(deadline) {
-				return "", "", -1, fmt.Errorf("ns eval: %w", err)
+				break
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
+
+		// Fall back to guest-agent eval (starts worker lazily)
+		req := struct {
+			Eval string `json:"eval"`
+		}{Eval: code}
+		err = ExecInNS(vm.NS.NSPath, "10.0.0.2:1024", req, &resp)
+		if err == nil {
+			return resp.Stdout, resp.Stderr, resp.ExitCode, nil
+		}
+		return "", "", -1, fmt.Errorf("eval: %w", err)
 	}
 
-	// Vsock fallback — send eval via the Cmd field workaround
+	// Vsock fallback
 	return vm.execVsock([]string{"/bin/sh", "-c", fmt.Sprintf("node -e '%s'", code)}, timeout)
 }
 

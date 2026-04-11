@@ -29,5 +29,10 @@ modprobe vmw_vsock_virtio_transport 2>/dev/null
 # Start guest agent (TCP + vsock)
 /usr/local/bin/guest-agent >/dev/console 2>&1 &
 
+# Start runtime eval server if available (captured in snapshot, survives restore)
+if [ -f /usr/local/lib/eval-server.js ]; then
+    node /usr/local/lib/eval-server.js 2>/dev/console &
+fi
+
 # Serial console fallback
 exec setsid sh -l </dev/ttyS0 >/dev/ttyS0 2>&1

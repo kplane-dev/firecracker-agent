@@ -185,7 +185,75 @@ func dialTCPRaw(addr string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), "tcp"), nil
 }
 
+// EvalInNS enters the namespace and POSTs code to the eval server (port 1025).
+// The eval server is an HTTP server running inside the VM (captured in snapshot).
+func EvalInNS(nsPath, addr, code string, resp interface{}) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	origNS, err := os.Open("/proc/self/ns/net")
+	if err != nil {
+		return fmt.Errorf("open current netns: %w", err)
+	}
+	defer origNS.Close()
+
+	targetNS, err := os.Open(nsPath)
+	if err != nil {
+		return fmt.Errorf("open target netns: %w", err)
+	}
+	defer targetNS.Close()
+
+	if _, _, errno := syscall.Syscall(sysSetns, targetNS.Fd(), uintptr(cloneNewnet), 0); errno != 0 {
+		return fmt.Errorf("setns: %w", errno)
+	}
+	defer func() {
+		syscall.Syscall(sysSetns, origNS.Fd(), uintptr(cloneNewnet), 0)
+	}()
+
+	// HTTP POST to the eval server
+	conn, err := dialTCPRaw(addr)
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer conn.Close()
+
+	// Write HTTP request
+	reqBody := []byte(code)
+	header := fmt.Sprintf("POST / HTTP/1.0\r\nContent-Length: %d\r\nContent-Type: text/plain\r\n\r\n", len(reqBody))
+	conn.Write([]byte(header))
+	conn.Write(reqBody)
+
+	// Read response (simple HTTP/1.0 — read until EOF)
+	var buf [65536]byte
+	var response []byte
+	for {
+		n, err := conn.Read(buf[:])
+		if n > 0 {
+			response = append(response, buf[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	// Parse HTTP response — find body after \r\n\r\n
+	body := response
+	if idx := findHTTPBody(response); idx >= 0 {
+		body = response[idx:]
+	}
+
+	return json.Unmarshal(body, resp)
+}
+
+func findHTTPBody(data []byte) int {
+	for i := 0; i+3 < len(data); i++ {
+		if data[i] == '\r' && data[i+1] == '\n' && data[i+2] == '\r' && data[i+3] == '\n' {
+			return i + 4
+		}
+	}
+	return -1
+}
+
 func init() {
-	// Ensure we have enough OS threads for namespace switching
 	klog.V(4).Infof("netns support initialized")
 }
