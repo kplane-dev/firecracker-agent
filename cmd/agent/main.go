@@ -82,8 +82,17 @@ func main() {
 		if image == "" {
 			image = "python"
 		}
+		cpuMillis := 0 // 0 = no limit
+		if s := r.URL.Query().Get("cpu"); s != "" {
+			fmt.Sscanf(s, "%d", &cpuMillis)
+		}
+		memMiB := 0 // 0 = use all booted memory
+		if s := r.URL.Query().Get("memory"); s != "" {
+			fmt.Sscanf(s, "%d", &memMiB)
+		}
+
 		start := time.Now()
-		v, fromWarm, err := p.Claim(image, warmVCPUs, warmMemMiB)
+		v, fromWarm, err := p.Claim(image, cpuMillis, memMiB)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
@@ -93,6 +102,8 @@ func main() {
 			"image":          v.Image,
 			"pid":            v.PID,
 			"from_warm_pool": fromWarm,
+			"cpu_millicores": v.CPUMillis,
+			"memory_mib":     v.MemoryMiB - v.BalloonMiB,
 			"claim_time_ms":  time.Since(start).Milliseconds(),
 		})
 	})

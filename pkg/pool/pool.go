@@ -42,7 +42,9 @@ func New(cfg vm.Config, maxVMs int, warmImages []string, minWarm, warmVCPUs, war
 }
 
 // Claim takes a VM from the warm pool (resuming it) or cold boots one.
-func (p *Pool) Claim(image string, vcpus, memMiB int) (*vm.VM, bool, error) {
+// cpuMillis is in Kubernetes-style millicores (500 = half core, 1000 = full core, 0 = no limit).
+// memMiB is the desired guest memory (0 = use pool default).
+func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -50,7 +52,7 @@ func (p *Pool) Claim(image string, vcpus, memMiB int) (*vm.VM, bool, error) {
 		return nil, false, fmt.Errorf("max VMs reached (%d)", p.maxVMs)
 	}
 
-	// Try warm pool — VMs are paused, resume on claim
+	// Try warm pool — VMs are paused with balloon inflated, resume and adjust on claim
 	if vms := p.warm[image]; len(vms) > 0 {
 		v := vms[len(vms)-1]
 		p.warm[image] = vms[:len(vms)-1]
@@ -61,20 +63,52 @@ func (p *Pool) Claim(image string, vcpus, memMiB int) (*vm.VM, bool, error) {
 			// Fall through to cold boot
 		} else {
 			p.active[v.ID] = v
-			klog.Infof("pool: claimed warm VM %s (image=%s, %d warm remaining)", v.ID, image, len(p.warm[image]))
+
+			// Adjust resources to requested levels
+			p.applyResources(v, cpuMillis, memMiB)
+
+			klog.Infof("pool: claimed warm VM %s (image=%s, cpu=%dm, mem=%dMiB, %d warm remaining)",
+				v.ID, image, v.CPUMillis, v.MemoryMiB-v.BalloonMiB, len(p.warm[image]))
 			return v, true, nil
 		}
 	}
 
 	// Cold boot
 	id := p.nextVMID()
-	v, err := vm.Boot(p.cfg, id, image, vcpus, memMiB)
+	bootMem := p.warmMemMiB
+	if memMiB > bootMem {
+		bootMem = memMiB
+	}
+	v, err := vm.Boot(p.cfg, id, image, 1, bootMem)
 	if err != nil {
 		return nil, false, err
 	}
 	p.active[v.ID] = v
-	klog.Infof("pool: cold booted VM %s (image=%s)", v.ID, image)
+	p.applyResources(v, cpuMillis, memMiB)
+	klog.Infof("pool: cold booted VM %s (image=%s, cpu=%dm, mem=%dMiB)", v.ID, image, v.CPUMillis, v.MemoryMiB-v.BalloonMiB)
 	return v, false, nil
+}
+
+// applyResources sets CPU cgroup limit and adjusts balloon for the requested memory.
+func (p *Pool) applyResources(v *vm.VM, cpuMillis, memMiB int) {
+	if cpuMillis > 0 {
+		if err := v.SetCPULimit(cpuMillis); err != nil {
+			klog.Warningf("pool: cpu limit failed for %s: %v", v.ID, err)
+		}
+	}
+	if memMiB > 0 && memMiB < v.MemoryMiB {
+		balloonAmount := v.MemoryMiB - memMiB
+		if err := v.SetBalloon(balloonAmount); err != nil {
+			klog.Warningf("pool: balloon failed for %s: %v", v.ID, err)
+		}
+	} else if memMiB == 0 || memMiB >= v.MemoryMiB {
+		// Give all memory — deflate balloon fully
+		if v.BalloonMiB > 0 {
+			if err := v.SetBalloon(0); err != nil {
+				klog.Warningf("pool: balloon deflate failed for %s: %v", v.ID, err)
+			}
+		}
+	}
 }
 
 // Release destroys a VM.
@@ -123,9 +157,18 @@ func (p *Pool) Fill() error {
 				klog.Warningf("pool: guest agent not ready for %s: %v", v.ID, err)
 			}
 
-			// Take baseline snapshot and leave VM paused.
-			// This resets dirty page tracking — future diff snapshots
-			// will only capture pages dirtied after resume.
+			// Inflate balloon to reclaim most memory while paused in the warm pool.
+			// Keep 64MB for the guest (kernel + init + guest-agent). The rest is
+			// returned to the host. On claim, we deflate to the requested level.
+			minGuestMiB := 64
+			if p.warmMemMiB > minGuestMiB {
+				if err := v.SetBalloon(p.warmMemMiB - minGuestMiB); err != nil {
+					klog.Warningf("pool: balloon inflate failed for %s: %v", v.ID, err)
+				}
+			}
+
+			// Take baseline snapshot (with balloon inflated) and leave VM paused.
+			// Dirty page tracking resets here — future diffs capture only post-resume changes.
 			baselineDir := fmt.Sprintf("%s/baselines/%s", p.cfg.WorkDir, v.ID)
 			if err := v.Snapshot(baselineDir, false); err != nil {
 				klog.Errorf("pool: baseline snapshot failed for %s: %v", v.ID, err)

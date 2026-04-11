@@ -39,6 +39,9 @@ type VM struct {
 	SocketPath  string
 	VsockPath   string
 	BaselineDir string // baseline snapshot dir (for diff-based branching)
+	CPUMillis   int    // CPU limit in millicores (0 = no limit)
+	MemoryMiB   int    // booted memory size
+	BalloonMiB  int    // current balloon inflation (memory reclaimed from guest)
 	PID         int
 	StartedAt   time.Time
 	Config      Config
@@ -104,6 +107,17 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int) (*VM, erro
 		return nil, fmt.Errorf("set vsock: %w", err)
 	}
 
+	// Balloon device for dynamic memory adjustment after boot
+	if err := vm.apiPut("/balloon", map[string]interface{}{
+		"amount_mib":                0,
+		"deflate_on_oom":            true,
+		"stats_polling_interval_s":  0,
+	}); err != nil {
+		klog.Warningf("vm %s: balloon config failed (continuing without): %v", id, err)
+	}
+
+	vm.MemoryMiB = memMiB
+
 	start := time.Now()
 	if err := vm.apiPut("/actions", map[string]interface{}{
 		"action_type": "InstanceStart",
@@ -126,6 +140,66 @@ func (vm *VM) Destroy() error {
 	}
 	os.RemoveAll(filepath.Dir(vm.SocketPath))
 	klog.Infof("vm %s destroyed", vm.ID)
+	return nil
+}
+
+// SetBalloon inflates or deflates the memory balloon.
+// amountMiB is how much memory to RECLAIM from the guest.
+// Guest available memory = MemoryMiB - amountMiB.
+func (vm *VM) SetBalloon(amountMiB int) error {
+	if err := vm.apiPatch("/balloon", map[string]interface{}{
+		"amount_mib": amountMiB,
+	}); err != nil {
+		return fmt.Errorf("set balloon to %dMiB: %w", amountMiB, err)
+	}
+	vm.BalloonMiB = amountMiB
+	klog.Infof("vm %s: balloon=%dMiB (guest has %dMiB)", vm.ID, amountMiB, vm.MemoryMiB-amountMiB)
+	return nil
+}
+
+// SetCPULimit applies a cgroup v2 CPU quota to the Firecracker process.
+// milliCPU uses the Kubernetes convention: 1000 = 1 full core, 500 = half core.
+func (vm *VM) SetCPULimit(milliCPU int) error {
+	if milliCPU <= 0 {
+		return nil
+	}
+
+	// Find our cgroup (cgroup v2: "0::/some/path")
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return fmt.Errorf("read cgroup: %w", err)
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(data)), "::", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("unexpected cgroup format: %s", string(data))
+	}
+	basePath := filepath.Join("/sys/fs/cgroup", parts[1])
+
+	// Enable cpu controller on parent
+	os.WriteFile(filepath.Join(basePath, "cgroup.subtree_control"), []byte("+cpu\n"), 0o644)
+
+	// Create sub-cgroup for this VM
+	vmCgroup := filepath.Join(basePath, vm.ID)
+	if err := os.MkdirAll(vmCgroup, 0o755); err != nil {
+		return fmt.Errorf("create cgroup %s: %w", vmCgroup, err)
+	}
+
+	// Set CPU quota: milliCPU 500 → 50000µs per 100000µs period
+	quota := milliCPU * 100
+	period := 100000
+	if err := os.WriteFile(filepath.Join(vmCgroup, "cpu.max"),
+		[]byte(fmt.Sprintf("%d %d\n", quota, period)), 0o644); err != nil {
+		return fmt.Errorf("set cpu.max: %w", err)
+	}
+
+	// Move Firecracker process into the cgroup
+	if err := os.WriteFile(filepath.Join(vmCgroup, "cgroup.procs"),
+		[]byte(fmt.Sprintf("%d\n", vm.PID)), 0o644); err != nil {
+		return fmt.Errorf("move pid %d to cgroup: %w", vm.PID, err)
+	}
+
+	vm.CPUMillis = milliCPU
+	klog.Infof("vm %s: cpu=%dm (pid %d → %s)", vm.ID, milliCPU, vm.PID, vmCgroup)
 	return nil
 }
 
