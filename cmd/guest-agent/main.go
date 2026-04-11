@@ -24,7 +24,8 @@ const (
 )
 
 type ExecRequest struct {
-	Cmd []string `json:"cmd"`
+	Cmd  []string `json:"cmd"`            // shell command (fallback)
+	Eval string   `json:"eval,omitempty"` // code to evaluate in the runtime worker
 }
 
 type ExecResponse struct {
@@ -33,7 +34,28 @@ type ExecResponse struct {
 	ExitCode int    `json:"exit_code"`
 }
 
+var runtimeWorker *worker
+
 func main() {
+	// Detect runtime and start persistent worker
+	if _, err := exec.LookPath("node"); err == nil {
+		w, err := startNodeWorker()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "guest-agent: node worker failed: %v\n", err)
+		} else {
+			runtimeWorker = w
+			fmt.Fprintf(os.Stderr, "guest-agent: node worker started (persistent)\n")
+		}
+	} else if _, err := exec.LookPath("python3"); err == nil {
+		w, err := startPythonWorker()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "guest-agent: python worker failed: %v\n", err)
+		} else {
+			runtimeWorker = w
+			fmt.Fprintf(os.Stderr, "guest-agent: python worker started (persistent)\n")
+		}
+	}
+
 	// TCP listener — survives snapshot restore with no reset
 	go func() {
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", tcpPort))
@@ -119,11 +141,30 @@ func handleVsockConn(fd int) {
 }
 
 func execCmd(req ExecRequest) ExecResponse {
-	if len(req.Cmd) == 0 {
+	// Eval path: send code to the persistent runtime worker
+	if req.Eval != "" && runtimeWorker != nil {
+		return runtimeWorker.eval(req.Eval)
+	}
+
+	// Shell path: spawn a process
+	if len(req.Cmd) == 0 && req.Eval == "" {
 		return ExecResponse{Stderr: "empty command", ExitCode: 1}
 	}
 
-	cmd := exec.Command(req.Cmd[0], req.Cmd[1:]...)
+	// If only eval was set but no worker, fall back to shell
+	args := req.Cmd
+	if len(args) == 0 && req.Eval != "" {
+		// No worker — try to run via the runtime binary directly
+		if _, err := exec.LookPath("node"); err == nil {
+			args = []string{"node", "-e", req.Eval}
+		} else if _, err := exec.LookPath("python3"); err == nil {
+			args = []string{"python3", "-c", req.Eval}
+		} else {
+			return ExecResponse{Stderr: "no runtime available for eval", ExitCode: 1}
+		}
+	}
+
+	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = append(os.Environ(), "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	out, err := cmd.CombinedOutput()
 

@@ -235,8 +235,9 @@ func main() {
 	mux.HandleFunc("/exec", func(w http.ResponseWriter, r *http.Request) {
 		vmID := r.URL.Query().Get("vm_id")
 		cmdStr := r.URL.Query().Get("cmd")
-		if vmID == "" || cmdStr == "" {
-			http.Error(w, "vm_id and cmd required", http.StatusBadRequest)
+		evalStr := r.URL.Query().Get("eval")
+		if vmID == "" || (cmdStr == "" && evalStr == "") {
+			http.Error(w, "vm_id and (cmd or eval) required", http.StatusBadRequest)
 			return
 		}
 
@@ -246,7 +247,17 @@ func main() {
 			return
 		}
 
-		stdout, stderr, exitCode, err := v.Exec([]string{"/bin/sh", "-c", cmdStr}, 30*time.Second)
+		var stdout, stderr string
+		var exitCode int
+		var err error
+
+		if evalStr != "" {
+			// Eval: send code to the persistent runtime worker
+			stdout, stderr, exitCode, err = v.ExecEval(evalStr, 30*time.Second)
+		} else {
+			// Shell: run via /bin/sh -c
+			stdout, stderr, exitCode, err = v.Exec([]string{"/bin/sh", "-c", cmdStr}, 30*time.Second)
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
