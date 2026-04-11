@@ -46,48 +46,86 @@ func New(cfg vm.Config, maxVMs int, warmImages []string, minWarm, warmVCPUs, war
 // cpuMillis is in Kubernetes-style millicores (500 = half core, 1000 = full core, 0 = no limit).
 // memMiB is the desired guest memory (0 = use pool default).
 func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) {
+	// Try warm pool first (fast path)
+	v, ok := p.claimWarm(image)
+	if ok {
+		p.applyResources(v, cpuMillis, memMiB)
+		klog.Infof("pool: claimed warm VM %s (image=%s, cpu=%dm, mem=%dMiB)",
+			v.ID, image, v.CPUMillis, v.MemoryMiB-v.BalloonMiB)
+		return v, true, nil
+	}
+
+	// Cold boot (slow path — releases lock during boot)
+	v, err := p.coldBoot(image, cpuMillis, memMiB)
+	if err != nil {
+		return nil, false, err
+	}
+	return v, false, nil
+}
+
+func (p *Pool) claimWarm(image string) (*vm.VM, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if len(p.active) >= p.maxVMs {
-		return nil, false, fmt.Errorf("max VMs reached (%d)", p.maxVMs)
+		return nil, false
 	}
 
-	// Try warm pool — VMs are paused with balloon inflated, resume and adjust on claim
-	if vms := p.warm[image]; len(vms) > 0 {
-		v := vms[len(vms)-1]
-		p.warm[image] = vms[:len(vms)-1]
-
-		if err := v.Resume(); err != nil {
-			klog.Errorf("pool: failed to resume warm VM %s: %v", v.ID, err)
-			v.Destroy()
-			// Fall through to cold boot
-		} else {
-			p.active[v.ID] = v
-
-			// Adjust resources to requested levels
-			p.applyResources(v, cpuMillis, memMiB)
-
-			klog.Infof("pool: claimed warm VM %s (image=%s, cpu=%dm, mem=%dMiB, %d warm remaining)",
-				v.ID, image, v.CPUMillis, v.MemoryMiB-v.BalloonMiB, len(p.warm[image]))
-			return v, true, nil
-		}
+	vms := p.warm[image]
+	if len(vms) == 0 {
+		return nil, false
 	}
 
-	// Cold boot
+	v := vms[len(vms)-1]
+	p.warm[image] = vms[:len(vms)-1]
+
+	if err := v.Resume(); err != nil {
+		klog.Errorf("pool: failed to resume warm VM %s: %v", v.ID, err)
+		v.Destroy()
+		return nil, false
+	}
+
+	p.active[v.ID] = v
+	return v, true
+}
+
+func (p *Pool) coldBoot(image string, cpuMillis, memMiB int) (*vm.VM, error) {
+	p.mu.Lock()
+	if len(p.active) >= p.maxVMs {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("max VMs reached (%d)", p.maxVMs)
+	}
 	id := p.nextVMID()
+	net, _ := p.allocateNetworkLocked(id)
+	p.mu.Unlock()
+
+	// Boot outside the lock (takes ~30ms + 2s for guest agent)
 	bootMem := p.warmMemMiB
 	if memMiB > bootMem {
 		bootMem = memMiB
 	}
-	v, err := vm.Boot(p.cfg, id, image, 1, bootMem)
+
+	v, err := vm.Boot(p.cfg, id, image, 1, bootMem, net)
 	if err != nil {
-		return nil, false, err
+		net.TeardownTAP()
+		return nil, err
 	}
+
+	if err := v.WaitReady(5 * time.Second); err != nil {
+		klog.Warningf("pool: cold boot guest agent not ready for %s: %v", v.ID, err)
+	}
+	if err := v.ConfigureGuestNetwork(net); err != nil {
+		klog.Warningf("pool: cold boot network config failed for %s: %v", v.ID, err)
+	}
+
+	p.mu.Lock()
 	p.active[v.ID] = v
+	p.mu.Unlock()
+
 	p.applyResources(v, cpuMillis, memMiB)
-	klog.Infof("pool: cold booted VM %s (image=%s, cpu=%dm, mem=%dMiB)", v.ID, image, v.CPUMillis, v.MemoryMiB-v.BalloonMiB)
-	return v, false, nil
+	klog.Infof("pool: cold booted VM %s (image=%s, cpu=%dm, mem=%dMiB)",
+		v.ID, image, v.CPUMillis, v.MemoryMiB-v.BalloonMiB)
+	return v, nil
 }
 
 // applyResources sets CPU cgroup limit and adjusts balloon for the requested memory.
@@ -126,8 +164,7 @@ func (p *Pool) Release(vmID string) error {
 	return v.Destroy()
 }
 
-// Fill pre-boots VMs, takes a baseline snapshot, and leaves them paused.
-// The baseline enables fast diff-based branching later.
+// Fill pre-boots VMs in parallel, takes baseline snapshots, and leaves them paused.
 func (p *Pool) Fill() error {
 	for _, image := range p.warmImages {
 		p.mu.Lock()
@@ -139,68 +176,75 @@ func (p *Pool) Fill() error {
 		}
 		p.mu.Unlock()
 
-		for i := 0; i < needed; i++ {
-			id := func() string {
-				p.mu.Lock()
-				defer p.mu.Unlock()
-				return p.nextVMID()
-			}()
-
-			start := time.Now()
-
-			// Allocate network (TAP + IPs) for this VM
-			net, err := func() (vm.Network, error) {
-				p.mu.Lock()
-				defer p.mu.Unlock()
-				return p.allocateNetworkLocked(id)
-			}()
-			if err != nil {
-				klog.Errorf("pool: network setup failed for %s: %v", id, err)
-				continue
-			}
-
-			v, err := vm.Boot(p.cfg, id, image, p.warmVCPUs, p.warmMemMiB, net)
-			if err != nil {
-				net.TeardownTAP()
-				klog.Errorf("pool: failed to pre-boot %s VM: %v", image, err)
-				continue
-			}
-
-			// Wait for guest agent, then configure guest network
-			if err := v.WaitReady(5 * time.Second); err != nil {
-				klog.Warningf("pool: guest agent not ready for %s: %v", v.ID, err)
-			}
-			if err := v.ConfigureGuestNetwork(net); err != nil {
-				klog.Warningf("pool: guest network config failed for %s: %v", v.ID, err)
-			}
-
-			// Inflate balloon to reclaim most memory while paused in the warm pool.
-			// Keep 64MB for the guest (kernel + init + guest-agent). The rest is
-			// returned to the host. On claim, we deflate to the requested level.
-			minGuestMiB := 64
-			if p.warmMemMiB > minGuestMiB {
-				if err := v.SetBalloon(p.warmMemMiB - minGuestMiB); err != nil {
-					klog.Warningf("pool: balloon inflate failed for %s: %v", v.ID, err)
-				}
-			}
-
-			// Take baseline snapshot (with balloon inflated) and leave VM paused.
-			// Dirty page tracking resets here — future diffs capture only post-resume changes.
-			baselineDir := fmt.Sprintf("%s/baselines/%s", p.cfg.WorkDir, v.ID)
-			if err := v.Snapshot(baselineDir, false); err != nil {
-				klog.Errorf("pool: baseline snapshot failed for %s: %v", v.ID, err)
-				v.Destroy()
-				continue
-			}
-			v.BaselineDir = baselineDir
-			// VM stays paused — resumed on Claim
-
-			p.mu.Lock()
-			p.warm[image] = append(p.warm[image], v)
-			klog.Infof("pool: warm VM %s (image=%s) ready in %v (paused at baseline, %d/%d warm)",
-				v.ID, image, time.Since(start), len(p.warm[image]), p.minWarm)
-			p.mu.Unlock()
+		if needed <= 0 {
+			continue
 		}
+
+		// Allocate IDs and networks under lock, boot in parallel outside lock
+		type bootJob struct {
+			id  string
+			net vm.Network
+		}
+		jobs := make([]bootJob, 0, needed)
+		p.mu.Lock()
+		for i := 0; i < needed; i++ {
+			id := p.nextVMID()
+			net, err := p.allocateNetworkLocked(id)
+			if err != nil {
+				klog.Errorf("pool: network alloc failed for %s: %v", id, err)
+				continue
+			}
+			jobs = append(jobs, bootJob{id: id, net: net})
+		}
+		p.mu.Unlock()
+
+		// Boot all VMs in parallel
+		var wg sync.WaitGroup
+		for _, job := range jobs {
+			wg.Add(1)
+			go func(id string, net vm.Network, img string) {
+				defer wg.Done()
+				start := time.Now()
+
+				v, err := vm.Boot(p.cfg, id, img, p.warmVCPUs, p.warmMemMiB, net)
+				if err != nil {
+					net.TeardownTAP()
+					klog.Errorf("pool: failed to pre-boot %s VM: %v", img, err)
+					return
+				}
+
+				if err := v.WaitReady(5 * time.Second); err != nil {
+					klog.Warningf("pool: guest agent not ready for %s: %v", v.ID, err)
+				}
+				if err := v.ConfigureGuestNetwork(net); err != nil {
+					klog.Warningf("pool: guest network config failed for %s: %v", v.ID, err)
+				}
+
+				// Inflate balloon to save host RAM while paused
+				minGuestMiB := 64
+				if p.warmMemMiB > minGuestMiB {
+					if err := v.SetBalloon(p.warmMemMiB - minGuestMiB); err != nil {
+						klog.Warningf("pool: balloon inflate failed for %s: %v", v.ID, err)
+					}
+				}
+
+				// Baseline snapshot — VM stays paused
+				baselineDir := fmt.Sprintf("%s/baselines/%s", p.cfg.WorkDir, v.ID)
+				if err := v.Snapshot(baselineDir, false); err != nil {
+					klog.Errorf("pool: baseline snapshot failed for %s: %v", v.ID, err)
+					v.Destroy()
+					return
+				}
+				v.BaselineDir = baselineDir
+
+				p.mu.Lock()
+				p.warm[img] = append(p.warm[img], v)
+				klog.Infof("pool: warm VM %s (image=%s) ready in %v (%d/%d warm)",
+					v.ID, img, time.Since(start), len(p.warm[img]), p.minWarm)
+				p.mu.Unlock()
+			}(job.id, job.net, image)
+		}
+		wg.Wait()
 	}
 	return nil
 }
