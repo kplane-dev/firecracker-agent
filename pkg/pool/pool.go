@@ -60,26 +60,24 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 		return nil, false, fmt.Errorf("max VMs reached (%d)", p.maxVMs)
 	}
 	id := p.nextVMID()
-	net, _ := p.allocateNetworkLocked(id)
 	p.mu.Unlock()
-
-	// Prefetch baseline memory into page cache (eliminates page faults during restore)
-	memPath := fmt.Sprintf("%s/mem", bl.vmstateDir)
-	vm.PrefetchFile(memPath)
 
 	start := time.Now()
 	vmstatePath := fmt.Sprintf("%s/vmstate", bl.vmstateDir)
+	memPath := fmt.Sprintf("%s/mem", bl.vmstateDir)
 
-	v, err := vm.Restore(p.cfg, id, image, vmstatePath, memPath, net)
+	// Create a network namespace for this VM (~3ms)
+	ns, err := vm.CreateNetNS()
 	if err != nil {
-		net.TeardownTAP()
-		return nil, false, fmt.Errorf("restore from baseline: %w", err)
+		return nil, false, fmt.Errorf("create netns: %w", err)
 	}
 
-	// Configure guest network via vsock (absorbs transport reset).
-	// After this, the TCP listener is reachable for fast exec.
-	if err := v.ConfigureGuestNetwork(net); err != nil {
-		klog.Warningf("pool: guest network config failed for %s: %v", v.ID, err)
+	// Restore inside the namespace — guest network is pre-configured
+	// in the baseline snapshot, no post-restore config needed.
+	v, err := vm.RestoreInNS(p.cfg, id, image, vmstatePath, memPath, ns)
+	if err != nil {
+		ns.Destroy()
+		return nil, false, fmt.Errorf("restore from baseline: %w", err)
 	}
 
 	p.mu.Lock()
@@ -142,19 +140,29 @@ func (p *Pool) Fill() error {
 
 		p.mu.Lock()
 		id := p.nextVMID()
-		net, _ := p.allocateNetworkLocked(id)
 		p.mu.Unlock()
 
+		// Boot baseline in a namespace with pre-configured network
+		ns, err := vm.CreateNetNS()
+		if err != nil {
+			klog.Errorf("pool: netns creation failed for %s: %v", id, err)
+			continue
+		}
+
+		// Boot with the TAP in the namespace
+		net := vm.NetworkInNS(ns)
 		v, err := vm.Boot(p.cfg, id, image, p.warmVCPUs, p.warmMemMiB, net)
 		if err != nil {
-			net.TeardownTAP()
+			ns.Destroy()
 			klog.Errorf("pool: failed to boot %s for baseline: %v", image, err)
 			continue
 		}
+		v.NS = ns
 
 		if err := v.WaitReady(10 * time.Second); err != nil {
 			klog.Warningf("pool: guest agent not ready for %s: %v", v.ID, err)
 		}
+		// Network is configured via vsock during baseline creation (one-time cost)
 		if err := v.ConfigureGuestNetwork(net); err != nil {
 			klog.Warningf("pool: guest network config failed for %s: %v", v.ID, err)
 		}

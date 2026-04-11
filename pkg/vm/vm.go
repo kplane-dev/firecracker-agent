@@ -38,11 +38,12 @@ type VM struct {
 	Image       string
 	SocketPath  string
 	VsockPath   string
-	BaselineDir string  // baseline snapshot dir (for diff-based branching)
-	Net         Network // network configuration
-	CPUMillis   int     // CPU limit in millicores (0 = no limit)
-	MemoryMiB   int     // booted memory size
-	BalloonMiB  int     // current balloon inflation (memory reclaimed from guest)
+	BaselineDir string   // baseline snapshot dir (for diff-based branching)
+	Net         Network  // network configuration (legacy, per-VM TAP)
+	NS          *NetNS   // network namespace (preferred — zero post-restore config)
+	CPUMillis   int      // CPU limit in millicores (0 = no limit)
+	MemoryMiB   int      // booted memory size
+	BalloonMiB  int      // current balloon inflation (memory reclaimed from guest)
 	PID         int
 	StartedAt   time.Time
 	Config      Config
@@ -67,7 +68,14 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int, net ...Net
 		vmNet = net[0]
 	}
 
-	cmd := exec.Command(cfg.FirecrackerBin, "--api-sock", socketPath)
+	var cmd *exec.Cmd
+	// If the VM has a namespace assigned, start Firecracker inside it
+	if vmNet.nsPath != "" {
+		cmd = exec.Command("nsenter", fmt.Sprintf("--net=%s", vmNet.nsPath), "--",
+			cfg.FirecrackerBin, "--api-sock", socketPath)
+	} else {
+		cmd = exec.Command(cfg.FirecrackerBin, "--api-sock", socketPath)
+	}
 	cmd.Dir = socketDir
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
@@ -168,7 +176,9 @@ func (vm *VM) Destroy() error {
 		vm.cmd.Process.Kill()
 		vm.cmd.Wait()
 	}
-	if vm.Net.TAPName != "" {
+	if vm.NS != nil {
+		vm.NS.Destroy()
+	} else if vm.Net.TAPName != "" {
 		vm.Net.TeardownTAP()
 	}
 	os.RemoveAll(filepath.Dir(vm.SocketPath))
@@ -231,10 +241,22 @@ func (vm *VM) SetCPULimit(milliCPU int) error {
 
 // Network holds the network configuration for a VM.
 type Network struct {
-	TAPName string // host TAP device name
-	HostIP  string // host-side IP (e.g., 10.0.1.1)
-	GuestIP string // guest-side IP (e.g., 10.0.1.2)
+	TAPName  string // host TAP device name
+	HostIP   string // host-side IP (e.g., 10.0.1.1)
+	GuestIP  string // guest-side IP (e.g., 10.0.1.2)
 	GuestMAC string // guest MAC address
+	nsPath   string // network namespace path (if running in a netns)
+}
+
+// NetworkInNS returns a network config for a VM running in a network namespace.
+func NetworkInNS(ns *NetNS) Network {
+	return Network{
+		TAPName:  "vmtap0",
+		HostIP:   "10.0.0.1",
+		GuestIP:  "10.0.0.2",
+		GuestMAC: "AA:FC:00:00:00:01",
+		nsPath:   ns.NSPath,
+	}
 }
 
 // AllocateNetwork derives network params from an index.
@@ -426,61 +448,35 @@ func (vm *VM) execVsock(cmd []string, timeout time.Duration) (stdout, stderr str
 }
 
 // Exec runs a command inside the VM via the guest agent.
-// Uses TCP over the TAP network (survives snapshot restore with no reset).
-// Falls back to vsock if no network is configured.
+// Preferred: TCP via network namespace (zero vsock transport reset).
+// Fallback: vsock (for VMs without namespaces).
 func (vm *VM) Exec(cmd []string, timeout time.Duration) (stdout, stderr string, exitCode int, err error) {
-	var conn net.Conn
-
-	if vm.Net.GuestIP != "" {
-		// TCP path — no transport reset after restore
-		addr := fmt.Sprintf("%s:1024", vm.Net.GuestIP)
-		deadline := time.Now().Add(500 * time.Millisecond)
-		for {
-			conn, err = net.DialTimeout("tcp", addr, 200*time.Millisecond)
-			if err == nil {
-				break
-			}
-			if time.Now().After(deadline) {
-				return "", "", -1, fmt.Errorf("tcp connect %s: %w", addr, err)
-			}
-			time.Sleep(10 * time.Millisecond)
+	if vm.NS != nil {
+		// Namespace TCP path — enter namespace, dial guest directly
+		req := struct {
+			Cmd []string `json:"cmd"`
+		}{Cmd: cmd}
+		var resp struct {
+			Stdout   string `json:"stdout"`
+			Stderr   string `json:"stderr"`
+			ExitCode int    `json:"exit_code"`
 		}
-	} else {
-		// Vsock fallback
+
 		deadline := time.Now().Add(500 * time.Millisecond)
 		for {
-			conn, err = vsockConnect(vm.VsockPath, 1024)
+			err = ExecInNS(vm.NS.NSPath, "10.0.0.2:1024", req, &resp)
 			if err == nil {
-				break
+				return resp.Stdout, resp.Stderr, resp.ExitCode, nil
 			}
 			if time.Now().After(deadline) {
-				return "", "", -1, fmt.Errorf("vsock connect: %w", err)
+				return "", "", -1, fmt.Errorf("ns exec: %w", err)
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
 
-	if timeout > 0 {
-		conn.SetDeadline(time.Now().Add(timeout))
-	}
-	defer conn.Close()
-
-	req := struct {
-		Cmd []string `json:"cmd"`
-	}{Cmd: cmd}
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return "", "", -1, fmt.Errorf("send: %w", err)
-	}
-
-	var resp struct {
-		Stdout   string `json:"stdout"`
-		Stderr   string `json:"stderr"`
-		ExitCode int    `json:"exit_code"`
-	}
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return "", "", -1, fmt.Errorf("recv: %w", err)
-	}
-	return resp.Stdout, resp.Stderr, resp.ExitCode, nil
+	// Vsock fallback
+	return vm.execVsock(cmd, timeout)
 }
 
 // Restore boots a new VM from a snapshot.
@@ -493,6 +489,40 @@ func Restore(cfg Config, id string, image string, vmstatePath string, memPath st
 	if err != nil {
 		return nil, err
 	}
+	if err := vm.LoadSnapshot(vmstatePath, memPath); err != nil {
+		return nil, err
+	}
+	return vm, nil
+}
+
+// RestoreInNS boots a VM from snapshot inside a network namespace.
+// The namespace already has the TAP configured — no post-restore network config needed.
+func RestoreInNS(cfg Config, id string, image string, vmstatePath string, memPath string, ns *NetNS) (*VM, error) {
+	socketDir := filepath.Join(cfg.WorkDir, id)
+	if err := os.MkdirAll(socketDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create socket dir: %w", err)
+	}
+	socketPath := filepath.Join(socketDir, "fc.sock")
+	os.Remove(socketPath)
+
+	cmd, err := ns.StartFirecracker(cfg.FirecrackerBin, socketPath, socketDir)
+	if err != nil {
+		return nil, err
+	}
+
+	vm := &VM{
+		ID:         id,
+		Image:      image,
+		SocketPath: socketPath,
+		VsockPath:  filepath.Join(socketDir, "vsock.sock"),
+		NS:         ns,
+		Config:     cfg,
+		cmd:        cmd,
+		client:     newAPIClient(socketPath),
+	}
+
+	waitForSocket(socketPath)
+
 	if err := vm.LoadSnapshot(vmstatePath, memPath); err != nil {
 		return nil, err
 	}
