@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -16,6 +17,8 @@ const (
 	agentPort    = 1024
 	afVsock      = 40
 	vmaddrCIDAny = 0xFFFFFFFF
+	maxReqSize   = 1 << 20 // 1MB max request
+	readTimeout  = 30       // seconds
 )
 
 type ExecRequest struct {
@@ -37,10 +40,10 @@ func main() {
 	fmt.Fprintf(os.Stderr, "guest-agent: listening on vsock port %d\n", agentPort)
 
 	for {
-		// Use raw accept syscall — Go's syscall.Accept doesn't support AF_VSOCK sockaddr
 		connFd, _, errno := syscall.Syscall(syscall.SYS_ACCEPT, uintptr(listenFd), 0, 0)
 		if errno != 0 {
 			fmt.Fprintf(os.Stderr, "guest-agent: accept: %v\n", errno)
+			time.Sleep(100 * time.Millisecond) // backoff on repeated errors
 			continue
 		}
 		syscall.SetNonblock(int(connFd), false)
@@ -51,16 +54,33 @@ func main() {
 func handleConn(fd int) {
 	defer syscall.Close(fd)
 
-	// Raw syscall read — Go's os.File/net.Conn poller doesn't support AF_VSOCK.
-	buf := make([]byte, 65536)
-	n, err := syscall.Read(fd, buf)
-	if err != nil || n == 0 {
-		writeJSON(fd, ExecResponse{Stderr: fmt.Sprintf("read: %v (n=%d)", err, n), ExitCode: 1})
-		return
+	// Set read timeout to prevent goroutine leak from idle connections
+	tv := syscall.Timeval{Sec: readTimeout}
+	syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
+
+	// Read request — loop to handle partial reads
+	buf := make([]byte, 0, 4096)
+	tmp := make([]byte, 4096)
+	for len(buf) < maxReqSize {
+		n, err := syscall.Read(fd, tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			// Check if we have a complete JSON object (ends with } or }\n)
+			if len(buf) > 0 && (buf[len(buf)-1] == '}' || (len(buf) > 1 && buf[len(buf)-2] == '}' && buf[len(buf)-1] == '\n')) {
+				break
+			}
+		}
+		if err != nil {
+			if len(buf) > 0 {
+				break // try to parse what we have
+			}
+			writeJSON(fd, ExecResponse{Stderr: fmt.Sprintf("read: %v", err), ExitCode: 1})
+			return
+		}
 	}
 
 	var req ExecRequest
-	if err := json.Unmarshal(buf[:n], &req); err != nil {
+	if err := json.Unmarshal(buf, &req); err != nil {
 		writeJSON(fd, ExecResponse{Stderr: fmt.Sprintf("decode: %v", err), ExitCode: 1})
 		return
 	}
@@ -112,7 +132,7 @@ func vsockListen(port uint32) (int, error) {
 		syscall.Close(fd)
 		return -1, fmt.Errorf("bind: %w", errno)
 	}
-	if err := syscall.Listen(fd, 5); err != nil {
+	if err := syscall.Listen(fd, 16); err != nil {
 		syscall.Close(fd)
 		return -1, fmt.Errorf("listen: %w", err)
 	}

@@ -81,18 +81,32 @@ func main() {
 		})
 	})
 
+	validImages := map[string]bool{"python": true, "node": true}
+
 	mux.HandleFunc("/claim", func(w http.ResponseWriter, r *http.Request) {
 		image := r.URL.Query().Get("image")
 		if image == "" {
 			image = "python"
 		}
-		cpuMillis := 0 // 0 = no limit
+		if !validImages[image] {
+			http.Error(w, fmt.Sprintf("invalid image %q, valid: python, node", image), http.StatusBadRequest)
+			return
+		}
+		cpuMillis := 0
 		if s := r.URL.Query().Get("cpu"); s != "" {
 			fmt.Sscanf(s, "%d", &cpuMillis)
+			if cpuMillis < 0 || cpuMillis > 4000 {
+				http.Error(w, "cpu must be 0-4000 millicores", http.StatusBadRequest)
+				return
+			}
 		}
-		memMiB := 0 // 0 = use all booted memory
+		memMiB := 0
 		if s := r.URL.Query().Get("memory"); s != "" {
 			fmt.Sscanf(s, "%d", &memMiB)
+			if memMiB < 0 || memMiB > 4096 {
+				http.Error(w, "memory must be 0-4096 MiB", http.StatusBadRequest)
+				return
+			}
 		}
 
 		start := time.Now()
@@ -135,6 +149,10 @@ func main() {
 		count := 3
 		if countStr != "" {
 			fmt.Sscanf(countStr, "%d", &count)
+		}
+		if count < 1 || count > 10 {
+			http.Error(w, "count must be 1-10", http.StatusBadRequest)
+			return
 		}
 
 		sourceVM := p.GetActive(vmID)

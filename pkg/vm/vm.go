@@ -89,13 +89,18 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int, net ...Net
 
 	waitForSocket(socketPath)
 
+	// cleanup destroys the VM on error (kills process, removes TAP, cleans socket dir)
+	cleanup := func(err error) (*VM, error) {
+		vm.Destroy()
+		return nil, err
+	}
+
 	if err := vm.apiPut("/boot-source", map[string]interface{}{
 		"kernel_image_path": cfg.KernelPath,
 		"initrd_path":       cfg.ImagePath(image),
 		"boot_args":         "console=ttyS0 reboot=k panic=1 pci=off quiet",
 	}); err != nil {
-		cmd.Process.Kill()
-		return nil, fmt.Errorf("set boot source: %w", err)
+		return cleanup(fmt.Errorf("set boot source: %w", err))
 	}
 
 	if err := vm.apiPut("/machine-config", map[string]interface{}{
@@ -103,23 +108,21 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int, net ...Net
 		"mem_size_mib":      memMiB,
 		"track_dirty_pages": true,
 	}); err != nil {
-		cmd.Process.Kill()
-		return nil, fmt.Errorf("set machine config: %w", err)
+		return cleanup(fmt.Errorf("set machine config: %w", err))
 	}
 
 	if err := vm.apiPut("/vsock", map[string]interface{}{
 		"guest_cid": 3,
 		"uds_path":  "vsock.sock",
 	}); err != nil {
-		cmd.Process.Kill()
-		return nil, fmt.Errorf("set vsock: %w", err)
+		return cleanup(fmt.Errorf("set vsock: %w", err))
 	}
 
 	// Balloon device for dynamic memory adjustment after boot
 	if err := vm.apiPut("/balloon", map[string]interface{}{
-		"amount_mib":                0,
-		"deflate_on_oom":            true,
-		"stats_polling_interval_s":  0,
+		"amount_mib":               0,
+		"deflate_on_oom":           true,
+		"stats_polling_interval_s": 0,
 	}); err != nil {
 		klog.Warningf("vm %s: balloon config failed (continuing without): %v", id, err)
 	}
@@ -133,8 +136,7 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int, net ...Net
 			"guest_mac":     vm.Net.GuestMAC,
 			"host_dev_name": vm.Net.TAPName,
 		}); err != nil {
-			cmd.Process.Kill()
-			return nil, fmt.Errorf("set network interface: %w", err)
+			return cleanup(fmt.Errorf("set network interface: %w", err))
 		}
 	}
 
@@ -142,8 +144,7 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int, net ...Net
 	if err := vm.apiPut("/actions", map[string]interface{}{
 		"action_type": "InstanceStart",
 	}); err != nil {
-		cmd.Process.Kill()
-		return nil, fmt.Errorf("start instance: %w", err)
+		return cleanup(fmt.Errorf("start instance: %w", err))
 	}
 	vm.StartedAt = start
 	vm.PID = cmd.Process.Pid
@@ -294,16 +295,19 @@ func (vm *VM) ConfigureGuestNetwork(net Network) error {
 }
 
 // EnableSSH generates a host key, injects the user's public key, and starts dropbear.
+// The public key is written via a heredoc to prevent shell injection.
 func (vm *VM) EnableSSH(authorizedKey string) error {
-	cmds := []string{
-		// Generate unique host key for this VM
-		"dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null",
-		// Inject user's public key
-		fmt.Sprintf("echo '%s' > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys", authorizedKey),
-		// Start dropbear (foreground daemon, password auth disabled)
-		"dropbear -R -s -g -p 22",
+	// Validate the key looks like an SSH public key (no shell metacharacters)
+	if strings.ContainsAny(authorizedKey, "'`$\\;&|") {
+		return fmt.Errorf("invalid characters in SSH public key")
 	}
-	cmd := strings.Join(cmds, " && ")
+
+	cmd := fmt.Sprintf(`dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null
+cat > /root/.ssh/authorized_keys << 'SSHEOF'
+%s
+SSHEOF
+chmod 600 /root/.ssh/authorized_keys
+dropbear -R -s -g -p 22`, authorizedKey)
 	_, stderr, exitCode, err := vm.Exec([]string{"/bin/sh", "-c", cmd}, 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("enable ssh: %w", err)
@@ -481,7 +485,7 @@ func (vm *VM) LoadSnapshot(vmstatePath string, memPath string) error {
 		}
 	}
 	if err := vm.apiPut("/snapshot/load", loadReq); err != nil {
-		vm.cmd.Process.Kill()
+		vm.Destroy()
 		return fmt.Errorf("load snapshot: %w", err)
 	}
 
