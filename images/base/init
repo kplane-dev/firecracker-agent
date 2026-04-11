@@ -1,6 +1,15 @@
 #!/bin/sh
 # Minimal init for Firecracker microVM (PID 1)
+# Root is a read-only ext4 block device with a tmpfs overlay for writes.
 
+# Set up writable overlay on top of read-only root
+mount -t tmpfs tmpfs /mnt
+mkdir -p /mnt/upper /mnt/work
+mount -t overlay overlay -o lowerdir=/,upperdir=/mnt/upper,workdir=/mnt/work /mnt
+
+# Pivot to the overlay
+cd /mnt
+pivot_root . mnt/old
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev 2>/dev/null
@@ -13,12 +22,11 @@ mount -t tmpfs tmpfs /run
 hostname sandbox
 ip link set lo up 2>/dev/null
 
-# Load vsock kernel modules if available
+# Load vsock kernel modules
 modprobe vsock 2>/dev/null
 modprobe vmw_vsock_virtio_transport 2>/dev/null
-modprobe vhost_vsock 2>/dev/null
 
-# Start guest agent for vsock communication with the host
+# Start guest agent (TCP + vsock)
 /usr/local/bin/guest-agent >/dev/console 2>&1 &
 
 # Serial console fallback
