@@ -238,11 +238,13 @@ type Network struct {
 }
 
 // AllocateNetwork derives network params from an index.
+// Guest IP is always 10.0.0.2 — each TAP is an isolated point-to-point link.
+// Host uses 10.0.0.1 with scope link (allows duplicate across TAPs).
 func AllocateNetwork(vmID string, index int) Network {
 	return Network{
 		TAPName:  fmt.Sprintf("vmtap-%s", vmID),
-		HostIP:   fmt.Sprintf("10.0.%d.1", index),
-		GuestIP:  fmt.Sprintf("10.0.%d.2", index),
+		HostIP:   "10.0.0.1",
+		GuestIP:  "10.0.0.2",
 		GuestMAC: fmt.Sprintf("AA:FC:00:00:%02X:%02X", index/256, index%256),
 	}
 }
@@ -258,11 +260,12 @@ func hostExec(args ...string) error {
 }
 
 // SetupTAP creates a TAP device on the host and configures it.
+// Uses scope link + noprefixroute so multiple TAPs can share 10.0.0.1.
 func (n Network) SetupTAP() error {
 	if err := hostExec("ip", "tuntap", "add", "dev", n.TAPName, "mode", "tap"); err != nil {
 		return fmt.Errorf("create tap: %w", err)
 	}
-	if err := hostExec("ip", "addr", "add", n.HostIP+"/30", "dev", n.TAPName); err != nil {
+	if err := hostExec("ip", "addr", "add", n.HostIP+"/30", "dev", n.TAPName, "scope", "link", "noprefixroute"); err != nil {
 		return fmt.Errorf("set ip: %w", err)
 	}
 	if err := hostExec("ip", "link", "set", n.TAPName, "up"); err != nil {

@@ -74,16 +74,17 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 		return nil, false, fmt.Errorf("restore from baseline: %w", err)
 	}
 
-	// Configure guest network for the new TAP
-	if err := v.ConfigureGuestNetwork(net); err != nil {
-		klog.Warningf("pool: guest network config failed for %s: %v", v.ID, err)
-	}
+	// Guest network is already configured in the baseline snapshot (10.0.0.2/30).
+	// The new TAP (via network_overrides) gets 10.0.0.1 with scope link.
+	// No per-restore vsock exec needed.
+
+	// Pre-warm vsock connection (absorbs transport reset latency)
+	v.WaitReady(1 * time.Second)
 
 	p.mu.Lock()
 	p.active[v.ID] = v
 	p.mu.Unlock()
 
-	// Adjust resources
 	p.applyResources(v, cpuMillis, memMiB)
 
 	restoreMs := time.Since(start).Milliseconds()
