@@ -132,6 +132,9 @@ func ensureWorker() {
 	if runtimeWorker != nil {
 		return
 	}
+	// Ensure PATH is set for LookPath
+	os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+
 	// Lazy start — handles both first boot and post-restore
 	if _, err := exec.LookPath("node"); err == nil {
 		w, err := startNodeWorker()
