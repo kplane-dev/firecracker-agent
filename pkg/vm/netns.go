@@ -10,7 +10,6 @@ import (
 )
 
 // NetNS is a network namespace with a TAP device ready for a Firecracker VM.
-// Held open by a sentinel process. All VMs share guest IP 10.0.0.2.
 type NetNS struct {
 	SentinelPID int
 	NSPath      string // /proc/<pid>/ns/net
@@ -83,52 +82,54 @@ func (ns *NetNS) hostExec(args ...string) error {
 	return nil
 }
 
-// ExecInNS runs a command in the guest via the network namespace.
-// Uses nsenter as a subprocess to avoid corrupting Go runtime's network state.
+// ExecInNS sends a JSON command to the guest agent via the network namespace.
+// Uses the nsexec helper binary — one fork, no shell chain, no Go runtime corruption.
 func ExecInNS(nsPath, guestAddr string, req interface{}, resp interface{}) error {
 	reqJSON, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
 
-	// nc sends the JSON and reads the response via the namespace's TCP.
-	host, port, _ := strings.Cut(guestAddr, ":")
-	script := fmt.Sprintf(
-		`printf '%%s\n' '%s' | nc -w 5 %s %s`,
-		strings.ReplaceAll(string(reqJSON), "'", "'\\''"),
-		host, port,
-	)
-
-	cmd := exec.Command("nsenter", fmt.Sprintf("--net=%s", nsPath), "--", "sh", "-c", script)
-	out, err := cmd.Output()
+	out, err := exec.Command("nsexec", nsPath, guestAddr, string(reqJSON)).Output()
 	if err != nil {
-		return fmt.Errorf("nsenter exec: %w", err)
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return fmt.Errorf("nsexec: %s", string(exitErr.Stderr))
+		}
+		return fmt.Errorf("nsexec: %w", err)
 	}
 	if len(out) == 0 {
-		return fmt.Errorf("empty response from guest")
+		return fmt.Errorf("empty response")
 	}
 	return json.Unmarshal(out, resp)
 }
 
-// EvalInNS sends code to the eval server (port 1025) via the namespace.
+// EvalInNS sends code to the eval HTTP server via the namespace.
+// Uses nsexec to POST to the eval server on port 1025.
 func EvalInNS(nsPath, addr, code string, resp interface{}) error {
-	host, port, _ := strings.Cut(addr, ":")
+	// Build a minimal HTTP POST request as the JSON payload
+	// The eval server accepts raw code as POST body and returns JSON
+	httpReq := fmt.Sprintf("POST / HTTP/1.0\r\nContent-Length: %d\r\n\r\n%s", len(code), code)
 
-	script := fmt.Sprintf(
-		`wget -qO- --post-data='%s' http://%s:%s/ 2>/dev/null`,
-		strings.ReplaceAll(code, "'", "'\\''"),
-		host, port,
-	)
-
-	cmd := exec.Command("nsenter", fmt.Sprintf("--net=%s", nsPath), "--", "sh", "-c", script)
-	out, err := cmd.Output()
+	out, err := exec.Command("nsexec", nsPath, addr, httpReq).Output()
 	if err != nil {
-		return fmt.Errorf("eval: %w", err)
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return fmt.Errorf("nsexec eval: %s", string(exitErr.Stderr))
+		}
+		return fmt.Errorf("nsexec eval: %w", err)
 	}
-	if len(out) == 0 {
+
+	// Parse HTTP response — find body after \r\n\r\n
+	body := out
+	for i := 0; i+3 < len(out); i++ {
+		if out[i] == '\r' && out[i+1] == '\n' && out[i+2] == '\r' && out[i+3] == '\n' {
+			body = out[i+4:]
+			break
+		}
+	}
+	if len(body) == 0 {
 		return fmt.Errorf("empty eval response")
 	}
-	return json.Unmarshal(out, resp)
+	return json.Unmarshal(body, resp)
 }
 
 func init() {
