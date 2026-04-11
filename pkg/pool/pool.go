@@ -84,8 +84,8 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 	p.active[v.ID] = v
 	p.mu.Unlock()
 
-	// Pre-warm the runtime worker (starts Node.js/Python REPL on first eval)
-	v.ExecEval("1", 5*time.Second)
+	// Pre-warm the runtime worker in background (starts Node.js/Python REPL)
+	go v.ExecEval("1", 5*time.Second)
 
 	p.applyResources(v, cpuMillis, memMiB)
 
