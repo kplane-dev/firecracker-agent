@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Build rootfs initrd images for Firecracker VMs.
+# Build rootfs ext4 images for Firecracker VMs.
 # Usage: ./images/build.sh [output-dir]
 #
-# Produces: <output-dir>/python.initrd, <output-dir>/node.initrd
-# Each is a gzip-compressed cpio archive suitable for Firecracker's initrd_path.
+# Produces: <output-dir>/python.ext4, <output-dir>/node.ext4
+# Each is a read-only ext4 block device image. No initrd unpack at boot — demand-paged.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -15,7 +15,7 @@ PLATFORM="${PLATFORM:-linux/amd64}"
 echo "=== Building base rootfs (${PLATFORM}) ==="
 docker build --platform "$PLATFORM" -t rootfs-base "$SCRIPT_DIR/base/"
 
-build_initrd() {
+build_ext4() {
     local name=$1
     echo "=== Building $name rootfs (${PLATFORM}) ==="
 
@@ -24,24 +24,27 @@ build_initrd() {
     local cid
     cid=$(docker create --platform "$PLATFORM" "rootfs-${name}" /bin/true)
 
-    # Convert Docker filesystem to cpio initrd inside a container
-    # (preserves permissions and device nodes without requiring host root)
+    # Export Docker filesystem and create ext4 image inside a container
     docker export "$cid" | docker run --rm --platform "$PLATFORM" -i alpine:3.22 sh -c '
-        apk add --no-cache cpio >/dev/null 2>&1
+        apk add --no-cache e2fsprogs >/dev/null 2>&1
         mkdir /rootfs && cd /rootfs
         tar xf -
-        find . | cpio -o -H newc 2>/dev/null
-    ' | gzip > "${OUT_DIR}/${name}.initrd"
+        SIZE=$(du -sm /rootfs | cut -f1)
+        SIZE=$((SIZE + 32))
+        dd if=/dev/zero of=/rootfs.ext4 bs=1M count=$SIZE 2>/dev/null
+        mkfs.ext4 -d /rootfs -L rootfs /rootfs.ext4 >/dev/null 2>&1
+        cat /rootfs.ext4
+    ' > "${OUT_DIR}/${name}.ext4"
 
     docker rm "$cid" > /dev/null
 
     local size
-    size=$(du -h "${OUT_DIR}/${name}.initrd" | cut -f1)
-    echo "  -> ${OUT_DIR}/${name}.initrd ($size)"
+    size=$(du -h "${OUT_DIR}/${name}.ext4" | cut -f1)
+    echo "  -> ${OUT_DIR}/${name}.ext4 ($size)"
 }
 
-build_initrd python
-build_initrd node
+build_ext4 python
+build_ext4 node
 
 echo ""
 echo "=== Done ==="

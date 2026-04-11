@@ -29,7 +29,7 @@ type Config struct {
 }
 
 func (c Config) ImagePath(image string) string {
-	return filepath.Join(c.ImageDir, image+".initrd")
+	return filepath.Join(c.ImageDir, image+".ext4")
 }
 
 // VM represents a running Firecracker microVM.
@@ -97,10 +97,19 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int, net ...Net
 
 	if err := vm.apiPut("/boot-source", map[string]interface{}{
 		"kernel_image_path": cfg.KernelPath,
-		"initrd_path":       cfg.ImagePath(image),
-		"boot_args":         "console=ttyS0 reboot=k panic=1 pci=off quiet",
+		"boot_args":         "console=ttyS0 reboot=k panic=1 pci=off quiet init=/init root=/dev/vda ro",
 	}); err != nil {
 		return cleanup(fmt.Errorf("set boot source: %w", err))
+	}
+
+	// Block device rootfs — demand-paged, no initrd unpack overhead
+	if err := vm.apiPut("/drives/rootfs", map[string]interface{}{
+		"drive_id":       "rootfs",
+		"path_on_host":   cfg.ImagePath(image),
+		"is_root_device": true,
+		"is_read_only":   true,
+	}); err != nil {
+		return cleanup(fmt.Errorf("set drive: %w", err))
 	}
 
 	if err := vm.apiPut("/machine-config", map[string]interface{}{
@@ -417,8 +426,12 @@ func (vm *VM) Exec(cmd []string, timeout time.Duration) (stdout, stderr string, 
 }
 
 // Restore boots a new VM from a snapshot.
-func Restore(cfg Config, id string, image string, vmstatePath string, memPath string) (*VM, error) {
-	vm, err := PrepareRestore(cfg, id, image)
+func Restore(cfg Config, id string, image string, vmstatePath string, memPath string, net ...Network) (*VM, error) {
+	var n Network
+	if len(net) > 0 {
+		n = net[0]
+	}
+	vm, err := PrepareRestore(cfg, id, image, n)
 	if err != nil {
 		return nil, err
 	}
