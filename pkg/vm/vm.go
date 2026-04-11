@@ -38,10 +38,11 @@ type VM struct {
 	Image       string
 	SocketPath  string
 	VsockPath   string
-	BaselineDir string // baseline snapshot dir (for diff-based branching)
-	CPUMillis   int    // CPU limit in millicores (0 = no limit)
-	MemoryMiB   int    // booted memory size
-	BalloonMiB  int    // current balloon inflation (memory reclaimed from guest)
+	BaselineDir string  // baseline snapshot dir (for diff-based branching)
+	Net         Network // network configuration
+	CPUMillis   int     // CPU limit in millicores (0 = no limit)
+	MemoryMiB   int     // booted memory size
+	BalloonMiB  int     // current balloon inflation (memory reclaimed from guest)
 	PID         int
 	StartedAt   time.Time
 	Config      Config
@@ -51,7 +52,8 @@ type VM struct {
 }
 
 // Boot starts a new Firecracker VM and returns it.
-func Boot(cfg Config, id string, image string, vcpus int, memMiB int) (*VM, error) {
+// If net is non-empty, a TAP device is created and a network interface is configured.
+func Boot(cfg Config, id string, image string, vcpus int, memMiB int, net ...Network) (*VM, error) {
 	socketDir := filepath.Join(cfg.WorkDir, id)
 	if err := os.MkdirAll(socketDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create socket dir: %w", err)
@@ -59,6 +61,11 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int) (*VM, erro
 	socketPath := filepath.Join(socketDir, "fc.sock")
 	os.Remove(socketPath)
 	os.Remove(filepath.Join(socketDir, "vsock.sock"))
+
+	var vmNet Network
+	if len(net) > 0 {
+		vmNet = net[0]
+	}
 
 	cmd := exec.Command(cfg.FirecrackerBin, "--api-sock", socketPath)
 	cmd.Dir = socketDir
@@ -74,6 +81,7 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int) (*VM, erro
 		Image:      image,
 		SocketPath: socketPath,
 		VsockPath:  filepath.Join(socketDir, "vsock.sock"),
+		Net:        vmNet,
 		Config:     cfg,
 		cmd:        cmd,
 		client:     newAPIClient(socketPath),
@@ -118,6 +126,18 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int) (*VM, erro
 
 	vm.MemoryMiB = memMiB
 
+	// Network interface (TAP must be created on host before configuring FC)
+	if vm.Net.TAPName != "" {
+		if err := vm.apiPut("/network-interfaces/eth0", map[string]interface{}{
+			"iface_id":      "eth0",
+			"guest_mac":     vm.Net.GuestMAC,
+			"host_dev_name": vm.Net.TAPName,
+		}); err != nil {
+			cmd.Process.Kill()
+			return nil, fmt.Errorf("set network interface: %w", err)
+		}
+	}
+
 	start := time.Now()
 	if err := vm.apiPut("/actions", map[string]interface{}{
 		"action_type": "InstanceStart",
@@ -137,6 +157,9 @@ func (vm *VM) Destroy() error {
 	if vm.cmd != nil && vm.cmd.Process != nil {
 		vm.cmd.Process.Kill()
 		vm.cmd.Wait()
+	}
+	if vm.Net.TAPName != "" {
+		vm.Net.TeardownTAP()
 	}
 	os.RemoveAll(filepath.Dir(vm.SocketPath))
 	klog.Infof("vm %s destroyed", vm.ID)
@@ -193,6 +216,80 @@ func (vm *VM) SetCPULimit(milliCPU int) error {
 
 	vm.CPUMillis = milliCPU
 	klog.Infof("vm %s: cpu=%dm (pid %d → %s)", vm.ID, milliCPU, vm.PID, vmCgroup)
+	return nil
+}
+
+// Network holds the network configuration for a VM.
+type Network struct {
+	TAPName string // host TAP device name
+	HostIP  string // host-side IP (e.g., 10.0.1.1)
+	GuestIP string // guest-side IP (e.g., 10.0.1.2)
+	GuestMAC string // guest MAC address
+}
+
+// AllocateNetwork derives network params from an index.
+func AllocateNetwork(vmID string, index int) Network {
+	return Network{
+		TAPName:  fmt.Sprintf("vmtap-%s", vmID),
+		HostIP:   fmt.Sprintf("10.0.%d.1", index),
+		GuestIP:  fmt.Sprintf("10.0.%d.2", index),
+		GuestMAC: fmt.Sprintf("AA:FC:00:00:%02X:%02X", index/256, index%256),
+	}
+}
+
+// hostExec runs a command in the host's mount+net namespace via nsenter.
+func hostExec(args ...string) error {
+	cmdArgs := append([]string{"--target", "1", "--mount", "--net", "--"}, args...)
+	out, err := exec.Command("nsenter", cmdArgs...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %s: %w", args[0], strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
+// SetupTAP creates a TAP device on the host and configures it.
+func (n Network) SetupTAP() error {
+	if err := hostExec("ip", "tuntap", "add", "dev", n.TAPName, "mode", "tap"); err != nil {
+		return fmt.Errorf("create tap: %w", err)
+	}
+	if err := hostExec("ip", "addr", "add", n.HostIP+"/30", "dev", n.TAPName); err != nil {
+		return fmt.Errorf("set ip: %w", err)
+	}
+	if err := hostExec("ip", "link", "set", n.TAPName, "up"); err != nil {
+		return fmt.Errorf("link up: %w", err)
+	}
+	return nil
+}
+
+// TeardownTAP removes the TAP device from the host.
+func (n Network) TeardownTAP() {
+	hostExec("ip", "tuntap", "del", "dev", n.TAPName, "mode", "tap")
+}
+
+// SetupNAT enables IP forwarding and masquerade for VM traffic (called once at startup).
+func SetupNAT() error {
+	if err := hostExec("sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
+		return err
+	}
+	// Masquerade all VM traffic (10.0.0.0/16)
+	hostExec("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", "10.0.0.0/16", "-j", "MASQUERADE")
+	return hostExec("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "10.0.0.0/16", "-j", "MASQUERADE")
+}
+
+// ConfigureGuestNetwork sets up the network inside the VM via vsock exec.
+func (vm *VM) ConfigureGuestNetwork(net Network) error {
+	cmd := fmt.Sprintf(
+		"ip addr flush dev eth0 2>/dev/null; ip addr add %s/30 dev eth0 && ip link set eth0 up && ip route add default via %s",
+		net.GuestIP, net.HostIP,
+	)
+	_, stderr, exitCode, err := vm.Exec([]string{"/bin/sh", "-c", cmd}, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("configure guest network: %w", err)
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("configure guest network: exit %d: %s", exitCode, stderr)
+	}
+	klog.Infof("vm %s: network configured (guest=%s, host=%s, tap=%s)", vm.ID, net.GuestIP, net.HostIP, net.TAPName)
 	return nil
 }
 
@@ -298,7 +395,7 @@ func Restore(cfg Config, id string, image string, vmstatePath string, memPath st
 // PrepareRestore starts a Firecracker process and waits for its API socket.
 // Call LoadSnapshot to actually load VM state. This split allows overlapping
 // process startup with other work (e.g., merge).
-func PrepareRestore(cfg Config, id string, image string) (*VM, error) {
+func PrepareRestore(cfg Config, id string, image string, net ...Network) (*VM, error) {
 	socketDir := filepath.Join(cfg.WorkDir, id)
 	if err := os.MkdirAll(socketDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create socket dir: %w", err)
@@ -324,15 +421,20 @@ func PrepareRestore(cfg Config, id string, image string) (*VM, error) {
 		cmd:        cmd,
 		client:     newAPIClient(socketPath),
 	}
+	if len(net) > 0 {
+		vm.Net = net[0]
+	}
 
 	waitForSocket(socketPath)
 	return vm, nil
 }
 
 // LoadSnapshot loads a snapshot into a prepared Firecracker process.
+// If the VM has a Network with a TAP name, network_overrides is used to
+// remap the snapshot's network device to the new TAP.
 func (vm *VM) LoadSnapshot(vmstatePath string, memPath string) error {
 	start := time.Now()
-	if err := vm.apiPut("/snapshot/load", map[string]interface{}{
+	loadReq := map[string]interface{}{
 		"snapshot_path": vmstatePath,
 		"mem_backend": map[string]interface{}{
 			"backend_type": "File",
@@ -340,7 +442,13 @@ func (vm *VM) LoadSnapshot(vmstatePath string, memPath string) error {
 		},
 		"enable_diff_snapshots": false,
 		"resume_vm":             true,
-	}); err != nil {
+	}
+	if vm.Net.TAPName != "" {
+		loadReq["network_overrides"] = []map[string]interface{}{
+			{"iface_id": "eth0", "host_dev_name": vm.Net.TAPName},
+		}
+	}
+	if err := vm.apiPut("/snapshot/load", loadReq); err != nil {
 		vm.cmd.Process.Kill()
 		return fmt.Errorf("load snapshot: %w", err)
 	}
@@ -351,11 +459,14 @@ func (vm *VM) LoadSnapshot(vmstatePath string, memPath string) error {
 	return nil
 }
 
+// NetAllocFunc allocates a network for a branch VM. If nil, branches have no network.
+type NetAllocFunc func(vmID string) (Network, error)
+
 // Branch takes a diff snapshot, merges it with the baseline, and restores N copies in parallel.
 // The merged mem file is shared across all branches (MAP_PRIVATE/CoW).
-func Branch(cfg Config, source *VM, count int) ([]*VM, error) {
+func Branch(cfg Config, source *VM, count int, allocNet NetAllocFunc) ([]*VM, error) {
 	if source.BaselineDir == "" {
-		return branchFull(cfg, source, count)
+		return branchFull(cfg, source, count, allocNet)
 	}
 
 	// Write diff snapshot to tmpfs (snap-ram) for RAM-speed writes.
@@ -404,7 +515,17 @@ func Branch(cfg Config, source *VM, count int) ([]*VM, error) {
 				preps[i] = prepared{err: err}
 				return
 			}
-			vm, err := PrepareRestore(cfg, branchID, source.Image)
+			// Allocate network for this branch
+			var branchNet Network
+			if allocNet != nil {
+				n, err := allocNet(branchID)
+				if err != nil {
+					klog.Warningf("branch %d: network alloc failed: %v", i, err)
+				} else {
+					branchNet = n
+				}
+			}
+			vm, err := PrepareRestore(cfg, branchID, source.Image, branchNet)
 			if err != nil {
 				preps[i] = prepared{err: err}
 				return
@@ -453,6 +574,12 @@ func Branch(cfg Config, source *VM, count int) ([]*VM, error) {
 				return
 			}
 			klog.Infof("branch %d: load=%v", i, time.Since(loadStart))
+			// Configure guest network for this branch (new IP for new TAP)
+			if preps[i].vm.Net.TAPName != "" {
+				if err := preps[i].vm.ConfigureGuestNetwork(preps[i].vm.Net); err != nil {
+					klog.Warningf("branch %d: guest network config failed: %v", i, err)
+				}
+			}
 			ch <- result{idx: i, vm: preps[i].vm}
 		}(i)
 	}
@@ -481,7 +608,7 @@ func Branch(cfg Config, source *VM, count int) ([]*VM, error) {
 }
 
 // branchFull is the fallback when no baseline exists (full snapshot).
-func branchFull(cfg Config, source *VM, count int) ([]*VM, error) {
+func branchFull(cfg Config, source *VM, count int, allocNet NetAllocFunc) ([]*VM, error) {
 	snapBase := filepath.Join(cfg.WorkDir, "snap-ram")
 	if _, err := os.Stat(snapBase); err != nil {
 		snapBase = filepath.Join(cfg.WorkDir, "snapshots")

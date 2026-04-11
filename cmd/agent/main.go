@@ -50,6 +50,10 @@ func main() {
 		log.Printf("warn: btrfs setup failed (falling back to host fs): %v", err)
 	}
 
+	if err := vm.SetupNAT(); err != nil {
+		log.Printf("warn: NAT setup failed (VMs won't have internet): %v", err)
+	}
+
 	cfg := vm.Config{
 		FirecrackerBin: firecrackerBin,
 		KernelPath:     kernelPath,
@@ -140,7 +144,9 @@ func main() {
 		}
 
 		start := time.Now()
-		branches, err := vm.Branch(cfg, sourceVM, count)
+		branches, err := vm.Branch(cfg, sourceVM, count, func(vmID string) (vm.Network, error) {
+			return p.AllocateNetwork(vmID)
+		})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

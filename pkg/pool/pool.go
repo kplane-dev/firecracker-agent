@@ -21,10 +21,11 @@ type Pool struct {
 	warmMemMiB int
 	warmImages []string
 
-	mu     sync.Mutex
-	warm   map[string][]*vm.VM // image -> paused warm VMs
-	active map[string]*vm.VM   // vmID -> VM
-	nextID int
+	mu      sync.Mutex
+	warm    map[string][]*vm.VM // image -> paused warm VMs
+	active  map[string]*vm.VM   // vmID -> VM
+	nextID  int
+	nextNet int // network index counter for IP allocation
 }
 
 // New creates a new pool.
@@ -146,15 +147,31 @@ func (p *Pool) Fill() error {
 			}()
 
 			start := time.Now()
-			v, err := vm.Boot(p.cfg, id, image, p.warmVCPUs, p.warmMemMiB)
+
+			// Allocate network (TAP + IPs) for this VM
+			net, err := func() (vm.Network, error) {
+				p.mu.Lock()
+				defer p.mu.Unlock()
+				return p.allocateNetworkLocked(id)
+			}()
 			if err != nil {
+				klog.Errorf("pool: network setup failed for %s: %v", id, err)
+				continue
+			}
+
+			v, err := vm.Boot(p.cfg, id, image, p.warmVCPUs, p.warmMemMiB, net)
+			if err != nil {
+				net.TeardownTAP()
 				klog.Errorf("pool: failed to pre-boot %s VM: %v", image, err)
 				continue
 			}
 
-			// Wait for guest agent to be ready
+			// Wait for guest agent, then configure guest network
 			if err := v.WaitReady(5 * time.Second); err != nil {
 				klog.Warningf("pool: guest agent not ready for %s: %v", v.ID, err)
+			}
+			if err := v.ConfigureGuestNetwork(net); err != nil {
+				klog.Warningf("pool: guest network config failed for %s: %v", v.ID, err)
 			}
 
 			// Inflate balloon to reclaim most memory while paused in the warm pool.
@@ -241,4 +258,20 @@ func (p *Pool) totalLocked() int {
 func (p *Pool) nextVMID() string {
 	p.nextID++
 	return fmt.Sprintf("fc-%d", p.nextID)
+}
+
+// AllocateNetwork assigns a unique network config and creates the TAP.
+func (p *Pool) AllocateNetwork(vmID string) (vm.Network, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.allocateNetworkLocked(vmID)
+}
+
+func (p *Pool) allocateNetworkLocked(vmID string) (vm.Network, error) {
+	p.nextNet++
+	net := vm.AllocateNetwork(vmID, p.nextNet)
+	if err := net.SetupTAP(); err != nil {
+		return net, err
+	}
+	return net, nil
 }
