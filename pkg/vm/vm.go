@@ -159,30 +159,23 @@ func (vm *VM) SetBalloon(amountMiB int) error {
 
 // SetCPULimit applies a cgroup v2 CPU quota to the Firecracker process.
 // milliCPU uses the Kubernetes convention: 1000 = 1 full core, 500 = half core.
+// Uses the host cgroup hierarchy (/host/sys/fs/cgroup) since the container's
+// cgroup doesn't allow moving processes to sub-cgroups.
 func (vm *VM) SetCPULimit(milliCPU int) error {
 	if milliCPU <= 0 {
 		return nil
 	}
 
-	// Find our cgroup (cgroup v2: "0::/some/path")
-	data, err := os.ReadFile("/proc/self/cgroup")
-	if err != nil {
-		return fmt.Errorf("read cgroup: %w", err)
-	}
-	parts := strings.SplitN(strings.TrimSpace(string(data)), "::", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("unexpected cgroup format: %s", string(data))
-	}
-	basePath := filepath.Join("/sys/fs/cgroup", parts[1])
-
-	// Enable cpu controller on parent
-	os.WriteFile(filepath.Join(basePath, "cgroup.subtree_control"), []byte("+cpu\n"), 0o644)
-
-	// Create sub-cgroup for this VM
-	vmCgroup := filepath.Join(basePath, vm.ID)
+	// Create a cgroup for this VM in the host hierarchy.
+	// /host is the hostPath mount of /.
+	hostCgroupBase := "/host/sys/fs/cgroup/firecracker.slice"
+	vmCgroup := filepath.Join(hostCgroupBase, vm.ID)
 	if err := os.MkdirAll(vmCgroup, 0o755); err != nil {
 		return fmt.Errorf("create cgroup %s: %w", vmCgroup, err)
 	}
+
+	// Enable cpu controller
+	os.WriteFile(filepath.Join(hostCgroupBase, "cgroup.subtree_control"), []byte("+cpu\n"), 0o644)
 
 	// Set CPU quota: milliCPU 500 → 50000µs per 100000µs period
 	quota := milliCPU * 100
@@ -192,7 +185,7 @@ func (vm *VM) SetCPULimit(milliCPU int) error {
 		return fmt.Errorf("set cpu.max: %w", err)
 	}
 
-	// Move Firecracker process into the cgroup
+	// Move Firecracker process into the cgroup (use host PID since hostPID=true)
 	if err := os.WriteFile(filepath.Join(vmCgroup, "cgroup.procs"),
 		[]byte(fmt.Sprintf("%d\n", vm.PID)), 0o644); err != nil {
 		return fmt.Errorf("move pid %d to cgroup: %w", vm.PID, err)
