@@ -54,8 +54,15 @@ func main() {
 	conn.Write([]byte(payload))
 	conn.Write([]byte("\n"))
 
-	// Read response to stdout
-	buf := make([]byte, 65536)
-	n, _ := conn.Read(buf)
-	os.Stdout.Write(buf[:n])
+	// Read full response to stdout (until EOF or timeout)
+	buf := make([]byte, 4096)
+	for {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			os.Stdout.Write(buf[:n])
+		}
+		if err != nil {
+			break
+		}
+	}
 }
