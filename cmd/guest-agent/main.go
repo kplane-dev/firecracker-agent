@@ -7,10 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -127,17 +125,49 @@ func handleVsockConn(fd int) {
 }
 
 // evalViaServer sends code to the eval HTTP server on localhost:1025.
-// This server is pre-started in the snapshot — zero startup cost.
+// Uses raw syscalls (not Go's net/http) to work correctly after snapshot restore.
 func evalViaServer(code string) (ExecResponse, error) {
-	resp, err := http.Post("http://127.0.0.1:1025/", "text/plain", strings.NewReader(code))
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
 	if err != nil {
-		return ExecResponse{}, err
+		return ExecResponse{}, fmt.Errorf("socket: %w", err)
 	}
-	defer resp.Body.Close()
+	defer syscall.Close(fd)
+
+	sa := &syscall.SockaddrInet4{Port: 1025, Addr: [4]byte{127, 0, 0, 1}}
+	if err := syscall.Connect(fd, sa); err != nil {
+		return ExecResponse{}, fmt.Errorf("connect: %w", err)
+	}
+
+	// Send HTTP POST
+	header := fmt.Sprintf("POST / HTTP/1.0\r\nContent-Length: %d\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n", len(code))
+	syscall.Write(fd, []byte(header))
+	syscall.Write(fd, []byte(code))
+
+	// Read response
+	var resp []byte
+	buf := make([]byte, 4096)
+	for {
+		n, err := syscall.Read(fd, buf)
+		if n > 0 {
+			resp = append(resp, buf[:n]...)
+		}
+		if err != nil || n == 0 {
+			break
+		}
+	}
+
+	// Find HTTP body after \r\n\r\n
+	body := resp
+	for i := 0; i+3 < len(resp); i++ {
+		if resp[i] == '\r' && resp[i+1] == '\n' && resp[i+2] == '\r' && resp[i+3] == '\n' {
+			body = resp[i+4:]
+			break
+		}
+	}
 
 	var result ExecResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return ExecResponse{}, err
+	if err := json.Unmarshal(body, &result); err != nil {
+		return ExecResponse{}, fmt.Errorf("decode: %w (body=%q)", err, string(body))
 	}
 	return result, nil
 }
