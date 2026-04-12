@@ -395,6 +395,13 @@ func (vm *VM) Snapshot(snapshotDir string, diff bool) error {
 }
 
 // Resume unpauses the VM after a snapshot.
+// Pause stops the vCPU. The VM state is preserved in memory.
+func (vm *VM) Pause() error {
+	return vm.apiPatch("/vm", map[string]interface{}{
+		"state": "Paused",
+	})
+}
+
 func (vm *VM) Resume() error {
 	return vm.apiPatch("/vm", map[string]interface{}{
 		"state": "Resumed",
