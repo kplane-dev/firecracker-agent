@@ -80,12 +80,15 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 		return nil, false, fmt.Errorf("restore from baseline: %w", err)
 	}
 
+	// Deflate balloon — baseline was snapshotted with balloon inflated.
+	// Restore inherits that state. Give the VM its full memory back.
+	if err := v.SetBalloon(0); err != nil {
+		klog.Warningf("pool: balloon deflate failed for %s: %v", v.ID, err)
+	}
+
 	p.mu.Lock()
 	p.active[v.ID] = v
 	p.mu.Unlock()
-
-	// Pre-warm the runtime worker in background (starts Node.js/Python REPL)
-	go v.ExecEval("1", 5*time.Second)
 
 	p.applyResources(v, cpuMillis, memMiB)
 
