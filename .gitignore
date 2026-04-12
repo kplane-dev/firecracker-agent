@@ -2,3 +2,4 @@ out/
 bin/
 images/base/guest-agent
 nsexec
+agent
