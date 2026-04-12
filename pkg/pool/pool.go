@@ -6,6 +6,7 @@ package pool
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kplane-dev/firecracker-agent/pkg/vm"
@@ -27,12 +28,13 @@ type Pool struct {
 	warmMemMiB int
 	warmImages []string
 
-	mu        sync.Mutex
-	baselines map[string]*baseline   // image -> baseline snapshot
-	warm      map[string][]*vm.VM    // image -> paused warm VMs
-	active    map[string]*vm.VM      // vmID -> running VM
-	nextID    int
-	nextNet   int
+	mu            sync.Mutex
+	baselines     map[string]*baseline   // image -> baseline snapshot
+	warm          map[string][]*vm.VM    // image -> paused warm VMs
+	active        map[string]*vm.VM      // vmID -> running VM
+	nextID        int
+	nextNet       int
+	replenishing  int32                  // atomic: 1 if replenish is running
 }
 
 // New creates a new pool.
@@ -78,8 +80,8 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 
 		p.applyResources(v, cpuMillis, memMiB)
 
-		// Replenish in background immediately
-		go p.replenishWarm(image)
+		// Replenish in background (throttled to 1 concurrent)
+		go p.throttledReplenish(image)
 
 		klog.Infof("pool: claimed warm %s (image=%s, resume=%dms, %d warm remaining)",
 			v.ID, image, time.Since(start).Milliseconds(), remaining)
@@ -128,10 +130,11 @@ func (p *Pool) restoreAndWarm(id, image string, bl *baseline) (*vm.VM, error) {
 		return nil, fmt.Errorf("restore: %w", err)
 	}
 
-	// Warm the guest — exercises kernel scheduler + loads node pages.
-	// This absorbs the ~65ms post-restore cold penalty.
+	// Warm the guest kernel — exercises scheduler, loads basic pages.
+	// Uses /bin/true (lightweight) instead of node -v (CPU-intensive)
+	// to avoid competing for CPU during replenish.
 	v.SerialKick()
-	v.Exec([]string{"node", "-v"}, 5*time.Second)
+	v.Exec([]string{"/bin/true"}, 5*time.Second)
 
 	return v, nil
 }
@@ -219,6 +222,15 @@ func (p *Pool) Fill() error {
 	return nil
 }
 
+// throttledReplenish ensures only one replenish runs at a time.
+func (p *Pool) throttledReplenish(image string) {
+	if !atomic.CompareAndSwapInt32(&p.replenishing, 0, 1) {
+		return // already replenishing
+	}
+	defer atomic.StoreInt32(&p.replenishing, 0)
+	p.replenishWarm(image)
+}
+
 // replenishWarm fills the warm pool for an image up to minWarm.
 func (p *Pool) replenishWarm(image string) {
 	p.mu.Lock()
@@ -236,39 +248,31 @@ func (p *Pool) replenishWarm(image string) {
 		return
 	}
 
-	// Create warm VMs in parallel
-	var wg sync.WaitGroup
+	// Create warm VMs one at a time to avoid CPU contention
 	for i := 0; i < needed; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		p.mu.Lock()
+		id := p.nextVMID()
+		p.mu.Unlock()
 
-			p.mu.Lock()
-			id := p.nextVMID()
-			p.mu.Unlock()
+		start := time.Now()
+		v, err := p.restoreAndWarm(id, image, bl)
+		if err != nil {
+			klog.Errorf("pool: warm VM failed for %s: %v", image, err)
+			continue
+		}
 
-			start := time.Now()
-			v, err := p.restoreAndWarm(id, image, bl)
-			if err != nil {
-				klog.Errorf("pool: warm VM failed for %s: %v", image, err)
-				return
-			}
+		if err := v.Pause(); err != nil {
+			klog.Errorf("pool: pause failed for %s: %v", v.ID, err)
+			v.Destroy()
+			continue
+		}
 
-			// Pause — VM is warm and ready, waiting for a claim
-			if err := v.Pause(); err != nil {
-				klog.Errorf("pool: pause failed for %s: %v", v.ID, err)
-				v.Destroy()
-				return
-			}
-
-			p.mu.Lock()
-			p.warm[image] = append(p.warm[image], v)
-			klog.Infof("pool: warm VM %s (image=%s) ready in %v (%d/%d warm)",
-				v.ID, image, time.Since(start), len(p.warm[image]), p.minWarm)
-			p.mu.Unlock()
-		}()
+		p.mu.Lock()
+		p.warm[image] = append(p.warm[image], v)
+		klog.Infof("pool: warm VM %s (image=%s) ready in %v (%d/%d warm)",
+			v.ID, image, time.Since(start), len(p.warm[image]), p.minWarm)
+		p.mu.Unlock()
 	}
-	wg.Wait()
 }
 
 // GetActive returns an active VM by ID, or nil if not found.
