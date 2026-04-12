@@ -5,6 +5,9 @@ package pool
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +38,26 @@ type Pool struct {
 	nextID        int
 	nextNet       int
 	replenishing  int32                  // atomic: 1 if replenish is running
+}
+
+// copyFileSync copies src to dst using O_SYNC to ensure data lands on the target filesystem.
+func copyFileSync(dst, src string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
 }
 
 // New creates a new pool.
@@ -130,18 +153,11 @@ func (p *Pool) restoreAndWarm(id, image string, bl *baseline) (*vm.VM, error) {
 		return nil, fmt.Errorf("restore: %w", err)
 	}
 
-	// Warm the guest: kick serial, then run an image-appropriate command
-	// to fault in shared libs and page cache before pausing. This makes
-	// the first exec after claim fast (~16ms vs ~135ms for node).
+	// Warm the guest kernel — exercises scheduler, loads basic pages.
+	// Uses /bin/true (lightweight) to avoid CPU contention during replenish.
+	// Page faults are fast because the mem file lives on tmpfs (snap-ram).
 	v.SerialKick()
-	switch image {
-	case "node":
-		v.Exec([]string{"node", "-v"}, 5*time.Second)
-	case "python":
-		v.Exec([]string{"python3", "-V"}, 5*time.Second)
-	default:
-		v.Exec([]string{"/bin/true"}, 5*time.Second)
-	}
+	v.Exec([]string{"/bin/true"}, 5*time.Second)
 
 	return v, nil
 }
@@ -218,6 +234,23 @@ func (p *Pool) Fill() error {
 		}
 
 		v.Destroy()
+
+		// Copy mem file to snap-ram (tmpfs) for RAM-speed page faults on restore.
+		// Firecracker mmaps with MAP_PRIVATE (demand-paged). From btrfs: ~140ms of
+		// major faults on first node -v. From tmpfs: minor faults only (~sub-ms).
+		snapRAMDir := filepath.Join(p.cfg.WorkDir, "snap-ram", image)
+		ramMemPath := filepath.Join(snapRAMDir, "mem")
+		diskMemPath := filepath.Join(baselineDir, "mem")
+		if err := os.MkdirAll(snapRAMDir, 0o755); err != nil {
+			klog.Warningf("pool: snap-ram mkdir failed for %s: %v (falling back to disk)", image, err)
+		} else if err := copyFileSync(ramMemPath, diskMemPath); err != nil {
+			klog.Warningf("pool: snap-ram copy failed for %s: %v (falling back to disk)", image, err)
+		} else {
+			klog.Infof("pool: baseline mem for %s copied to snap-ram (%s)", image, ramMemPath)
+			baselineDir = snapRAMDir
+			// Copy vmstate too (small, ~14K)
+			copyFileSync(filepath.Join(snapRAMDir, "vmstate"), filepath.Join(p.cfg.WorkDir, "baselines", image, "vmstate"))
+		}
 
 		p.mu.Lock()
 		p.baselines[image] = &baseline{vmstateDir: baselineDir, image: image}
