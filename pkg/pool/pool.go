@@ -130,11 +130,18 @@ func (p *Pool) restoreAndWarm(id, image string, bl *baseline) (*vm.VM, error) {
 		return nil, fmt.Errorf("restore: %w", err)
 	}
 
-	// Warm the guest kernel — exercises scheduler, loads basic pages.
-	// Uses /bin/true (lightweight) instead of node -v (CPU-intensive)
-	// to avoid competing for CPU during replenish.
+	// Warm the guest: kick serial, then run an image-appropriate command
+	// to fault in shared libs and page cache before pausing. This makes
+	// the first exec after claim fast (~16ms vs ~135ms for node).
 	v.SerialKick()
-	v.Exec([]string{"/bin/true"}, 5*time.Second)
+	switch image {
+	case "node":
+		v.Exec([]string{"node", "-v"}, 5*time.Second)
+	case "python":
+		v.Exec([]string{"python3", "-V"}, 5*time.Second)
+	default:
+		v.Exec([]string{"/bin/true"}, 5*time.Second)
+	}
 
 	return v, nil
 }
