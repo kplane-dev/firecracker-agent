@@ -67,6 +67,9 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 		p.active[v.ID] = v
 		p.mu.Unlock()
 
+		remaining := len(p.warm[image])
+		p.mu.Unlock()
+
 		// Resume the paused VM (~1ms, no kernel warmup needed)
 		start := time.Now()
 		if err := v.Resume(); err != nil {
@@ -77,8 +80,11 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 
 		p.applyResources(v, cpuMillis, memMiB)
 
+		// Replenish in background immediately
+		go p.replenishWarm(image)
+
 		klog.Infof("pool: claimed warm %s (image=%s, resume=%dms, %d warm remaining)",
-			v.ID, image, time.Since(start).Milliseconds(), len(p.warm[image]))
+			v.ID, image, time.Since(start).Milliseconds(), remaining)
 		return v, true, nil
 	}
 
