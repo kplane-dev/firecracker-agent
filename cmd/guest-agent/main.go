@@ -143,6 +143,10 @@ func evalViaServer(code string) (ExecResponse, error) {
 	syscall.Write(fd, []byte(header))
 	syscall.Write(fd, []byte(code))
 
+	// Set short read timeout — eval server responds in <20ms
+	tv := syscall.Timeval{Sec: 0, Usec: 500000} // 500ms
+	syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
+
 	// Read response
 	var resp []byte
 	buf := make([]byte, 4096)
@@ -150,6 +154,12 @@ func evalViaServer(code string) (ExecResponse, error) {
 		n, err := syscall.Read(fd, buf)
 		if n > 0 {
 			resp = append(resp, buf[:n]...)
+			// Check if we have the full HTTP response (headers + body)
+			if bodyStart := findBody(resp); bodyStart >= 0 {
+				if cl := parseContentLength(resp[:bodyStart]); cl > 0 && len(resp) >= bodyStart+cl {
+					break // got full response
+				}
+			}
 		}
 		if err != nil || n == 0 {
 			break
@@ -170,6 +180,39 @@ func evalViaServer(code string) (ExecResponse, error) {
 		return ExecResponse{}, fmt.Errorf("decode: %w (body=%q)", err, string(body))
 	}
 	return result, nil
+}
+
+func findBody(data []byte) int {
+	for i := 0; i+3 < len(data); i++ {
+		if data[i] == '\r' && data[i+1] == '\n' && data[i+2] == '\r' && data[i+3] == '\n' {
+			return i + 4
+		}
+	}
+	return -1
+}
+
+func parseContentLength(headers []byte) int {
+	s := string(headers)
+	for _, line := range splitLines(s) {
+		if len(line) > 16 && (line[:16] == "Content-Length: " || line[:16] == "content-length: ") {
+			var cl int
+			fmt.Sscanf(line[16:], "%d", &cl)
+			return cl
+		}
+	}
+	return -1
+}
+
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i := 0; i < len(s)-1; i++ {
+		if s[i] == '\r' && s[i+1] == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 2
+		}
+	}
+	return lines
 }
 
 var workerMu sync.Mutex
