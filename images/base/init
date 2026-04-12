@@ -1,15 +1,7 @@
 #!/bin/sh
 # Minimal init for Firecracker microVM (PID 1)
-# Root is a read-only ext4 block device with a tmpfs overlay for writes.
+# Root is read-only ext4. Writable dirs via tmpfs overlays.
 
-# Set up writable overlay on top of read-only root
-mount -t tmpfs tmpfs /mnt
-mkdir -p /mnt/upper /mnt/work
-mount -t overlay overlay -o lowerdir=/,upperdir=/mnt/upper,workdir=/mnt/work /mnt
-
-# Pivot to the overlay
-cd /mnt
-pivot_root . mnt/old
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev 2>/dev/null
@@ -18,6 +10,20 @@ mount -t devpts devpts /dev/pts
 mount -t tmpfs tmpfs /dev/shm
 mount -t tmpfs tmpfs /tmp
 mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /var    # writable /var for logs, cache
+mount -t tmpfs tmpfs /root   # writable home
+mount -t tmpfs tmpfs /etc    # writable /etc for resolv.conf, hostname, ssh
+
+# Copy essential config from read-only root to writable /etc
+cp /mnt/old_etc/passwd /etc/ 2>/dev/null
+cp /mnt/old_etc/group /etc/ 2>/dev/null
+cp /mnt/old_etc/shells /etc/ 2>/dev/null
+# Note: /etc is tmpfs so we need to populate it
+echo "root:x:0:0:root:/root:/bin/sh" > /etc/passwd
+echo "root:x:0:" > /etc/group
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+echo "127.0.0.1 localhost sandbox" > /etc/hosts
+echo "sandbox" > /etc/hostname
 
 hostname sandbox
 ip link set lo up 2>/dev/null
@@ -29,8 +35,8 @@ modprobe vmw_vsock_virtio_transport 2>/dev/null
 # Start guest agent (TCP + vsock)
 /usr/local/bin/guest-agent >/dev/console 2>&1 &
 
-# Start runtime eval server if available (captured in snapshot, survives restore)
-if [ -f /usr/local/lib/eval-server.js ]; then
+# Start eval server if available (Node.js HTTP eval on port 1025)
+if [ -f /usr/local/lib/eval-server.js ] && command -v node >/dev/null 2>&1; then
     node /usr/local/lib/eval-server.js 2>/dev/console &
 fi
 
