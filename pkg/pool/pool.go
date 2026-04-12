@@ -14,7 +14,7 @@ import (
 
 // baseline holds the paths to a snapshot that can be restored.
 type baseline struct {
-	vmstateDir string // directory containing vmstate + mem files
+	vmstateDir string
 	image      string
 }
 
@@ -29,6 +29,7 @@ type Pool struct {
 	mu        sync.Mutex
 	baselines map[string]*baseline // image -> baseline snapshot
 	active    map[string]*vm.VM    // vmID -> VM
+	nsPool    []*vm.NetNS          // pre-created namespaces
 	nextID    int
 	nextNet   int
 }
@@ -66,10 +67,10 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 	vmstatePath := fmt.Sprintf("%s/vmstate", bl.vmstateDir)
 	memPath := fmt.Sprintf("%s/mem", bl.vmstateDir)
 
-	// Create a network namespace for this VM (~3ms)
-	ns, err := vm.CreateNetNS()
+	// Grab a pre-created namespace (instant) or create on demand
+	ns, err := p.grabNS()
 	if err != nil {
-		return nil, false, fmt.Errorf("create netns: %w", err)
+		return nil, false, fmt.Errorf("netns: %w", err)
 	}
 
 	// Restore inside the namespace — guest network is pre-configured
@@ -78,12 +79,6 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 	if err != nil {
 		ns.Destroy()
 		return nil, false, fmt.Errorf("restore from baseline: %w", err)
-	}
-
-	// Deflate balloon — baseline was snapshotted with balloon inflated.
-	// Restore inherits that state. Give the VM its full memory back.
-	if err := v.SetBalloon(0); err != nil {
-		klog.Warningf("pool: balloon deflate failed for %s: %v", v.ID, err)
 	}
 
 	p.mu.Lock()
@@ -173,14 +168,6 @@ func (p *Pool) Fill() error {
 			klog.Warningf("pool: guest network config failed for %s: %v", v.ID, err)
 		}
 
-		// Inflate balloon to minimize snapshot size
-		minGuestMiB := 64
-		if p.warmMemMiB > minGuestMiB {
-			if err := v.SetBalloon(p.warmMemMiB - minGuestMiB); err != nil {
-				klog.Warningf("pool: balloon inflate failed for %s: %v", v.ID, err)
-			}
-		}
-
 		// Snapshot
 		baselineDir := fmt.Sprintf("%s/baselines/%s", p.cfg.WorkDir, image)
 		if err := v.Snapshot(baselineDir, false); err != nil {
@@ -199,6 +186,10 @@ func (p *Pool) Fill() error {
 		klog.Infof("pool: baseline for %s ready in %v (snapshot at %s)",
 			image, time.Since(start), baselineDir)
 	}
+
+	// Pre-create namespace pool
+	p.fillNSPool(10)
+
 	return nil
 }
 
@@ -260,4 +251,46 @@ func (p *Pool) totalLocked() int {
 func (p *Pool) nextVMID() string {
 	p.nextID++
 	return fmt.Sprintf("fc-%d", p.nextID)
+}
+
+// grabNS gets a pre-created namespace or creates one on demand.
+func (p *Pool) grabNS() (*vm.NetNS, error) {
+	p.mu.Lock()
+	if len(p.nsPool) > 0 {
+		ns := p.nsPool[len(p.nsPool)-1]
+		p.nsPool = p.nsPool[:len(p.nsPool)-1]
+		p.mu.Unlock()
+		// Replenish in background
+		go p.replenishNS()
+		return ns, nil
+	}
+	p.mu.Unlock()
+	return vm.CreateNetNS()
+}
+
+// replenishNS adds one namespace to the pool.
+func (p *Pool) replenishNS() {
+	ns, err := vm.CreateNetNS()
+	if err != nil {
+		klog.Warningf("pool: failed to pre-create netns: %v", err)
+		return
+	}
+	p.mu.Lock()
+	p.nsPool = append(p.nsPool, ns)
+	p.mu.Unlock()
+}
+
+// fillNSPool pre-creates namespaces.
+func (p *Pool) fillNSPool(count int) {
+	for i := 0; i < count; i++ {
+		ns, err := vm.CreateNetNS()
+		if err != nil {
+			klog.Warningf("pool: failed to pre-create netns: %v", err)
+			continue
+		}
+		p.mu.Lock()
+		p.nsPool = append(p.nsPool, ns)
+		p.mu.Unlock()
+	}
+	klog.Infof("pool: pre-created %d namespaces", count)
 }

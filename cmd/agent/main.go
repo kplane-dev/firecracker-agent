@@ -255,7 +255,7 @@ func main() {
 			// Eval: send code to the persistent runtime worker
 			stdout, stderr, exitCode, err = v.ExecEval(evalStr, 30*time.Second)
 		} else {
-			// Shell: run via /bin/sh -c
+			// Send command directly — guest-agent wraps in sh -c if needed
 			stdout, stderr, exitCode, err = v.Exec([]string{"/bin/sh", "-c", cmdStr}, 30*time.Second)
 		}
 		if err != nil {
