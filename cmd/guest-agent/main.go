@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -124,6 +126,22 @@ func handleVsockConn(fd int) {
 	writeJSON(fd, resp)
 }
 
+// evalViaServer sends code to the eval HTTP server on localhost:1025.
+// This server is pre-started in the snapshot — zero startup cost.
+func evalViaServer(code string) (ExecResponse, error) {
+	resp, err := http.Post("http://127.0.0.1:1025/", "text/plain", strings.NewReader(code))
+	if err != nil {
+		return ExecResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	var result ExecResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return ExecResponse{}, err
+	}
+	return result, nil
+}
+
 var workerMu sync.Mutex
 
 func ensureWorker() {
@@ -152,8 +170,13 @@ func ensureWorker() {
 }
 
 func execCmd(req ExecRequest) ExecResponse {
-	// Eval path: send code to the persistent runtime worker
+	// Eval path: try the eval server (port 1025, pre-started in snapshot) first,
+	// fall back to the worker REPL
 	if req.Eval != "" {
+		if resp, err := evalViaServer(req.Eval); err == nil {
+			return resp
+		}
+		// Fall back to worker
 		ensureWorker()
 		if runtimeWorker != nil {
 			return runtimeWorker.eval(req.Eval)
