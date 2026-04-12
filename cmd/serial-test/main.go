@@ -64,10 +64,8 @@ func main() {
 	for {
 		select {
 		case line := <-outputCh:
-			if strings.Contains(line, "guest-agent") || strings.Contains(line, "sandbox") {
-				fmt.Printf("  [guest] %s\n", line)
-			}
-			if strings.Contains(line, "listening") || strings.Contains(line, "#") {
+			fmt.Printf("  [boot] %s\n", line)
+			if strings.Contains(line, "#") || strings.Contains(line, "sandbox") || strings.Contains(line, "login") || strings.Contains(line, "~") {
 				goto BOOTED
 			}
 		case <-deadline:
