@@ -5,13 +5,15 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o /firecracker-agent ./cmd/agent && \
     CGO_ENABLED=0 go build -o /nsexec ./cmd/nsexec && \
-    CGO_ENABLED=0 go build -o /benchmark ./cmd/benchmark
+    CGO_ENABLED=0 go build -o /benchmark ./cmd/benchmark && \
+    CGO_ENABLED=0 go build -o /serial-test ./cmd/serial-test
 
 FROM alpine:3.22
 RUN apk add --no-cache ca-certificates btrfs-progs coreutils
 COPY --from=builder /firecracker-agent /usr/local/bin/firecracker-agent
 COPY --from=builder /nsexec /usr/local/bin/nsexec
 COPY --from=builder /benchmark /usr/local/bin/benchmark
+COPY --from=builder /serial-test /usr/local/bin/serial-test
 
 # Firecracker binary, kernel, and rootfs images are pre-built via `make all`
 # and expected in out/ at docker build time.
