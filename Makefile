@@ -33,8 +33,9 @@ guest-agent:
 # --- Rootfs images ---
 
 images: guest-agent
+	cp cmd/serial-agent/serial-agent.c images/base/serial-agent.c
 	./images/build.sh out/images
-	rm -f images/base/guest-agent
+	rm -f images/base/guest-agent images/base/serial-agent.c
 
 # --- Go binary ---
 

@@ -3,6 +3,7 @@ package vm
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 
@@ -58,17 +59,27 @@ func (ns *NetNS) Destroy() {
 }
 
 // StartFirecracker starts a Firecracker process inside this network namespace.
-func (ns *NetNS) StartFirecracker(firecrackerBin, socketPath, workDir string) (*exec.Cmd, error) {
+// Returns the command and stdin/stdout pipes for serial console I/O.
+func (ns *NetNS) StartFirecracker(firecrackerBin, socketPath, workDir string) (*exec.Cmd, io.Writer, io.Reader, error) {
 	cmd := exec.Command("nsenter", fmt.Sprintf("--net=%s", ns.NSPath), "--",
 		firecrackerBin, "--api-sock", socketPath)
 	cmd.Dir = workDir
-	cmd.Stdout = nil
+
+	// Connect stdin/stdout for serial console communication
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("stdin pipe: %w", err)
+	}
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("stdout pipe: %w", err)
+	}
 	cmd.Stderr = nil
 
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start firecracker in netns: %w", err)
+		return nil, nil, nil, fmt.Errorf("start firecracker in netns: %w", err)
 	}
-	return cmd, nil
+	return cmd, stdinPipe, stdoutPipe, nil
 }
 
 // hostExec runs a command inside the namespace using the host's binaries.

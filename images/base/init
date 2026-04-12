@@ -10,7 +10,7 @@ mount -t tmpfs tmpfs /dev/shm
 mount -t tmpfs tmpfs /tmp
 mount -t tmpfs tmpfs /run
 
-# Writable /etc overlay (for resolv.conf, hosts, etc.)
+# Writable /etc overlay
 mkdir -p /tmp/etc-upper /tmp/etc-work
 mount -t overlay overlay -o lowerdir=/etc,upperdir=/tmp/etc-upper,workdir=/tmp/etc-work /etc 2>/dev/null
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
@@ -22,7 +22,7 @@ ip link set lo up 2>/dev/null
 modprobe vsock 2>/dev/null
 modprobe vmw_vsock_virtio_transport 2>/dev/null
 
-# Start guest agent (TCP + vsock)
+# Start Go guest-agent for TCP exec (branches, legacy, network config)
 /usr/local/bin/guest-agent >/dev/console 2>&1 &
 
 # Start eval server if available
@@ -30,5 +30,6 @@ if [ -f /usr/local/lib/eval-server.js ] && command -v node >/dev/null 2>&1; then
     node /usr/local/lib/eval-server.js >/dev/console 2>&1 &
 fi
 
-# Serial console fallback
-exec setsid sh -l </dev/ttyS0 >/dev/ttyS0 2>&1
+# Serial agent takes over ttyS0 — primary exec path
+# C binary: zero runtime overhead after snapshot restore
+exec /usr/local/bin/serial-agent </dev/ttyS0 >/dev/ttyS0 2>/dev/console

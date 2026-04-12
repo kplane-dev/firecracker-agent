@@ -2,6 +2,7 @@
 package vm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -48,8 +49,11 @@ type VM struct {
 	StartedAt   time.Time
 	Config      Config
 
-	cmd    *exec.Cmd
-	client *http.Client
+	cmd      *exec.Cmd
+	client   *http.Client
+	serialIn io.Writer       // Firecracker stdin → guest serial
+	serialOut *bufio.Scanner // Firecracker stdout → guest serial output
+	serialMu sync.Mutex     // serialize serial commands
 }
 
 // Boot starts a new Firecracker VM and returns it.
@@ -478,12 +482,23 @@ func (vm *VM) ExecEval(code string, timeout time.Duration) (stdout, stderr strin
 	return vm.execVsock([]string{"/bin/sh", "-c", fmt.Sprintf("node -e '%s'", code)}, timeout)
 }
 
-// Exec runs a command inside the VM via the guest agent.
-// Preferred: TCP via network namespace (zero vsock transport reset).
-// Fallback: vsock (for VMs without namespaces).
+// Exec runs a command inside the VM.
+// Preferred: serial console (zero overhead after restore).
+// Fallback: TCP via namespace, then vsock.
 func (vm *VM) Exec(cmd []string, timeout time.Duration) (stdout, stderr string, exitCode int, err error) {
+	// Extract the shell command string
+	cmdStr := strings.Join(cmd, " ")
+	if len(cmd) >= 3 && cmd[0] == "/bin/sh" && cmd[1] == "-c" {
+		cmdStr = strings.Join(cmd[2:], " ")
+	}
+
+	// Serial path — direct pipe to guest, no TCP, no fork
+	if vm.serialIn != nil {
+		return vm.execSerial(cmdStr, timeout)
+	}
+
+	// Namespace TCP fallback
 	if vm.NS != nil {
-		// Namespace TCP path — enter namespace, dial guest directly
 		req := struct {
 			Cmd []string `json:"cmd"`
 		}{Cmd: cmd}
@@ -508,6 +523,41 @@ func (vm *VM) Exec(cmd []string, timeout time.Duration) (stdout, stderr string, 
 
 	// Vsock fallback
 	return vm.execVsock(cmd, timeout)
+}
+
+// execSerial sends a command via the Firecracker serial console pipe.
+// The C serial-agent on the guest reads from ttyS0, runs the command,
+// and writes a JSON response. Zero runtime overhead after snapshot restore.
+func (vm *VM) execSerial(command string, timeout time.Duration) (string, string, int, error) {
+	vm.serialMu.Lock()
+	defer vm.serialMu.Unlock()
+
+	// Write command to serial stdin
+	_, err := fmt.Fprintf(vm.serialIn, "%s\n", command)
+	if err != nil {
+		return "", "", -1, fmt.Errorf("serial write: %w", err)
+	}
+
+	// Read lines from serial stdout until we get a JSON response
+	// (skip kernel messages, FC logs, and empty lines)
+	for vm.serialOut.Scan() {
+		line := vm.serialOut.Text()
+		if len(line) == 0 || line[0] != '{' {
+			continue // skip non-JSON lines (kernel messages, prompts)
+		}
+
+		var resp struct {
+			Stdout   string `json:"stdout"`
+			Stderr   string `json:"stderr"`
+			ExitCode int    `json:"exit_code"`
+		}
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			continue // not valid JSON, skip
+		}
+		return resp.Stdout, resp.Stderr, resp.ExitCode, nil
+	}
+
+	return "", "", -1, fmt.Errorf("serial: no response (scanner error: %v)", vm.serialOut.Err())
 }
 
 // Restore boots a new VM from a snapshot.
@@ -536,7 +586,7 @@ func RestoreInNS(cfg Config, id string, image string, vmstatePath string, memPat
 	socketPath := filepath.Join(socketDir, "fc.sock")
 	os.Remove(socketPath)
 
-	cmd, err := ns.StartFirecracker(cfg.FirecrackerBin, socketPath, socketDir)
+	cmd, serialIn, serialOutReader, err := ns.StartFirecracker(cfg.FirecrackerBin, socketPath, socketDir)
 	if err != nil {
 		return nil, err
 	}
@@ -550,6 +600,8 @@ func RestoreInNS(cfg Config, id string, image string, vmstatePath string, memPat
 		Config:     cfg,
 		cmd:        cmd,
 		client:     newAPIClient(socketPath),
+		serialIn:   serialIn,
+		serialOut:  bufio.NewScanner(serialOutReader),
 	}
 
 	waitForSocket(socketPath)
