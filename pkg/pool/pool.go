@@ -103,10 +103,21 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 
 		p.applyResources(v, cpuMillis, memMiB)
 
+		// Warm V8/runtime immediately after resume so the user's first exec is fast.
+		// This runs the image's main binary once — the guest kernel caches the exec
+		// pattern, shared libs, and runtime state. Cost: ~130ms for node, but the
+		// user's first node -v drops from ~130ms to ~16ms.
+		switch image {
+		case "node":
+			v.Exec([]string{"node", "-e", "0"}, 5*time.Second)
+		case "python":
+			v.Exec([]string{"python3", "-c", ""}, 5*time.Second)
+		}
+
 		// Replenish in background (throttled to 1 concurrent)
 		go p.throttledReplenish(image)
 
-		klog.Infof("pool: claimed warm %s (image=%s, resume=%dms, %d warm remaining)",
+		klog.Infof("pool: claimed warm %s (image=%s, resume+warmup=%dms, %d warm remaining)",
 			v.ID, image, time.Since(start).Milliseconds(), remaining)
 		return v, true, nil
 	}
