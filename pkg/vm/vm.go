@@ -728,7 +728,7 @@ func (vm *VM) loadSnapshot(vmstatePath string, memPath string, useUffd bool) err
 				"backend_path": uffdSock,
 			},
 			"enable_diff_snapshots": false,
-			"resume_vm":             true,
+			"resume_vm":             false, // don't resume yet — wait for prefetch
 		}
 	} else {
 		loadReq = map[string]interface{}{
@@ -750,6 +750,27 @@ func (vm *VM) loadSnapshot(vmstatePath string, memPath string, useUffd bool) err
 	if err := vm.apiPut("/snapshot/load", loadReq); err != nil {
 		vm.Destroy()
 		return fmt.Errorf("load snapshot: %w", err)
+	}
+
+	// If using UFFD, wait for prefetch to complete, then resume the VM.
+	// All pages are pre-populated — the guest starts with zero page faults.
+	if useUffd {
+		uffdSock := filepath.Join(filepath.Dir(vm.SocketPath), "uffd.sock")
+		donePath := uffdSock + ".done"
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(donePath); err == nil {
+				break
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+		os.Remove(donePath)
+
+		if err := vm.apiPatch("/vm", map[string]interface{}{"state": "Resumed"}); err != nil {
+			vm.Destroy()
+			return fmt.Errorf("resume after prefetch: %w", err)
+		}
+		klog.Infof("vm %s: prefetch complete, resumed", vm.ID)
 	}
 
 	vm.StartedAt = start

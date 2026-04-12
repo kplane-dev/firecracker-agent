@@ -17,9 +17,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,16 +41,13 @@ struct region {
     uint64_t page_size;
 };
 
-/* Shared state between fault thread and prefetch thread. */
+/* Shared state for the handler. */
 struct handler_state {
     int                uffd_fd;
     void              *backing;        /* mmap'd snapshot mem file */
     size_t             backing_size;
     struct region      regions[MAX_REGIONS];
     int                num_regions;
-    /* Bitmap: 1 bit per page, set when page is installed.
-     * Prefetch skips pages already served on-demand. */
-    atomic_char       *installed;
     uint64_t           total_pages;
 };
 
@@ -97,72 +93,44 @@ static int parse_regions(const char *json, int len, struct region *out, int max)
     return count;
 }
 
-/* Compute page index across all regions. */
-static uint64_t page_index(struct handler_state *s, int region, uint64_t offset_in_region) {
-    uint64_t idx = 0;
-    for (int i = 0; i < region; i++)
-        idx += s->regions[i].size / s->regions[i].page_size;
-    idx += offset_in_region / s->regions[region].page_size;
-    return idx;
-}
+/* Prefetch: eagerly install all pages. Called before VM is resumed,
+ * so no on-demand faults race with this — we own the entire address space.
+ * Signals completion by creating a .done marker file. */
+static void prefetch_all(struct handler_state *s, const char *uds_path) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
 
-/* Mark a page as installed in the bitmap. Returns 1 if it was already set. */
-static int mark_installed(struct handler_state *s, uint64_t idx) {
-    uint64_t byte = idx / 8;
-    char bit = 1 << (idx % 8);
-    char old = atomic_fetch_or(&s->installed[byte], bit);
-    return (old & bit) != 0;
-}
-
-/* Perform UFFDIO_COPY for one page. Returns 0 on success, -1 on error. */
-static int copy_page(struct handler_state *s, uint64_t dst, void *src, uint64_t len) {
-    struct uffdio_copy copy = {
-        .dst  = dst,
-        .src  = (uint64_t)src,
-        .len  = len,
-        .mode = 0, /* wake faulting thread */
-    };
-    if (ioctl(s->uffd_fd, UFFDIO_COPY, &copy) == -1) {
-        if (errno == EEXIST)
-            return 0; /* already installed — race with prefetch, safe */
-        if (errno == EAGAIN)
-            return -1; /* REMOVE event pending — caller must drain */
-        return -1;
-    }
-    return 0;
-}
-
-/* Prefetch thread: eagerly install all pages before the guest needs them. */
-static void *prefetch_thread(void *arg) {
-    struct handler_state *s = (struct handler_state *)arg;
-
+    uint64_t installed = 0;
     for (int r = 0; r < s->num_regions; r++) {
         uint64_t psize = s->regions[r].page_size;
         uint64_t npages = s->regions[r].size / psize;
 
         for (uint64_t p = 0; p < npages; p++) {
-            uint64_t idx = page_index(s, r, p * psize);
-            if (mark_installed(s, idx))
-                continue; /* already served on-demand */
-
             uint64_t dst = s->regions[r].base_addr + p * psize;
             void *src = (char *)s->backing + s->regions[r].offset + p * psize;
 
-            /* Use DONTWAKE mode — no thread is faulting on this page */
             struct uffdio_copy copy = {
                 .dst  = dst,
                 .src  = (uint64_t)src,
                 .len  = psize,
                 .mode = UFFDIO_COPY_MODE_DONTWAKE,
             };
-            if (ioctl(s->uffd_fd, UFFDIO_COPY, &copy) == -1) {
-                if (errno == EEXIST || errno == EAGAIN)
-                    continue; /* page already there or REMOVE pending */
-                /* Non-fatal — page will be served on-demand */
-            }
+            if (ioctl(s->uffd_fd, UFFDIO_COPY, &copy) != -1)
+                installed++;
+            /* EEXIST/EAGAIN: skip — not expected pre-resume */
         }
     }
-    return NULL;
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    fprintf(stderr, "uffd-handler: prefetched %lu/%lu pages in %ldms\n",
+            (unsigned long)installed, (unsigned long)s->total_pages, ms);
+
+    /* Signal completion */
+    char done_path[256];
+    snprintf(done_path, sizeof(done_path), "%s.done", uds_path);
+    int fd = open(done_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd >= 0) close(fd);
 }
 
 /*
@@ -269,22 +237,21 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Compute total pages and allocate bitmap */
+    /* Compute total pages */
     state.total_pages = 0;
     for (int i = 0; i < state.num_regions; i++)
         state.total_pages += state.regions[i].size / state.regions[i].page_size;
 
-    size_t bitmap_bytes = (state.total_pages + 7) / 8;
-    state.installed = calloc(bitmap_bytes, 1);
-
     fprintf(stderr, "uffd-handler: %d regions, %lu pages, mem=%zuMB\n",
             state.num_regions, (unsigned long)state.total_pages, mem_size / (1024*1024));
 
-    /* Start prefetch thread */
-    pthread_t prefetch;
-    pthread_create(&prefetch, NULL, prefetch_thread, &state);
+    /* Pre-populate ALL pages before the VM is resumed.
+     * resume_vm=false in the snapshot load request, so no guest faults
+     * race with this — we install every page, then signal done,
+     * then Go code resumes the VM. Zero page faults at runtime. */
+    prefetch_all(&state, uds_path);
 
-    /* Main loop: handle on-demand page faults */
+    /* Event loop: handle balloon REMOVE events and late page faults. */
     struct pollfd pfd = {.fd = uffd_fd, .events = POLLIN};
 
     for (;;) {
@@ -307,11 +274,11 @@ int main(int argc, char **argv) {
         if (msg.event == UFFD_EVENT_PAGEFAULT) {
             uint64_t fault_addr = msg.arg.pagefault.address;
 
-            /* Find the region this address belongs to */
+            /* Find the region and serve the page */
             for (int r = 0; r < state.num_regions; r++) {
                 uint64_t base = state.regions[r].base_addr;
-                uint64_t end  = base + state.regions[r].size;
-                if (fault_addr < base || fault_addr >= end)
+                uint64_t rend = base + state.regions[r].size;
+                if (fault_addr < base || fault_addr >= rend)
                     continue;
 
                 uint64_t psize = state.regions[r].page_size;
@@ -319,11 +286,11 @@ int main(int argc, char **argv) {
                 uint64_t dst = base + page_off;
                 void *src = (char *)backing + state.regions[r].offset + page_off;
 
-                /* Mark as installed so prefetch skips it */
-                uint64_t idx = page_index(&state, r, page_off);
-                mark_installed(&state, idx);
-
-                copy_page(&state, dst, src, psize);
+                struct uffdio_copy copy = {
+                    .dst = dst, .src = (uint64_t)src,
+                    .len = psize, .mode = 0,
+                };
+                ioctl(state.uffd_fd, UFFDIO_COPY, &copy);
                 break;
             }
         } else if (msg.event == UFFD_EVENT_REMOVE) {
@@ -337,9 +304,7 @@ int main(int argc, char **argv) {
     }
 
     /* Cleanup */
-    pthread_join(prefetch, NULL);
     munmap(backing, mem_size);
-    free(state.installed);
     close(uffd_fd);
 
     return 0;
