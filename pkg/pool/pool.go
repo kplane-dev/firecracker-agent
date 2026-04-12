@@ -187,8 +187,13 @@ func (p *Pool) Fill() error {
 			image, time.Since(start), baselineDir)
 	}
 
-	// Pre-create namespace pool
-	p.fillNSPool(10)
+	// Pre-create namespace pool (one-time, not in maintenance loop)
+	p.mu.Lock()
+	needNS := len(p.nsPool) < 10
+	p.mu.Unlock()
+	if needNS {
+		p.fillNSPool(10)
+	}
 
 	return nil
 }
