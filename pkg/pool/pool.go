@@ -147,15 +147,14 @@ func (p *Pool) restoreAndWarm(id, image string, bl *baseline) (*vm.VM, error) {
 	vmstatePath := fmt.Sprintf("%s/vmstate", bl.vmstateDir)
 	memPath := fmt.Sprintf("%s/mem", bl.vmstateDir)
 
-	v, err := vm.RestoreInNS(p.cfg, id, image, vmstatePath, memPath, ns)
+	v, err := vm.RestoreInNS(p.cfg, id, image, vmstatePath, memPath, ns, true)
 	if err != nil {
 		ns.Destroy()
 		return nil, fmt.Errorf("restore: %w", err)
 	}
 
 	// Warm the guest kernel — exercises scheduler, loads basic pages.
-	// Uses /bin/true (lightweight) to avoid CPU contention during replenish.
-	// Page faults are fast because the mem file lives on tmpfs (snap-ram).
+	// UFFD handler pre-populates all pages eagerly, so this is fast.
 	v.SerialKick()
 	v.Exec([]string{"/bin/true"}, 5*time.Second)
 

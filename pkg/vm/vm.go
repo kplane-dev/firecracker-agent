@@ -49,11 +49,12 @@ type VM struct {
 	StartedAt   time.Time
 	Config      Config
 
-	cmd      *exec.Cmd
-	client   *http.Client
-	serialIn io.Writer       // Firecracker stdin → guest serial
-	serialOut *bufio.Scanner // Firecracker stdout → guest serial output
-	serialMu sync.Mutex     // serialize serial commands
+	cmd         *exec.Cmd
+	uffdHandler *exec.Cmd    // uffd page fault handler process
+	client      *http.Client
+	serialIn    io.Writer       // Firecracker stdin → guest serial
+	serialOut   *bufio.Scanner // Firecracker stdout → guest serial output
+	serialMu    sync.Mutex     // serialize serial commands
 }
 
 // Boot starts a new Firecracker VM and returns it.
@@ -179,6 +180,10 @@ func (vm *VM) Destroy() error {
 	if vm.cmd != nil && vm.cmd.Process != nil {
 		vm.cmd.Process.Kill()
 		vm.cmd.Wait()
+	}
+	if vm.uffdHandler != nil && vm.uffdHandler.Process != nil {
+		vm.uffdHandler.Process.Kill()
+		vm.uffdHandler.Wait()
 	}
 	if vm.NS != nil {
 		vm.NS.Destroy()
@@ -595,7 +600,8 @@ func Restore(cfg Config, id string, image string, vmstatePath string, memPath st
 
 // RestoreInNS boots a VM from snapshot inside a network namespace.
 // The namespace already has the TAP configured — no post-restore network config needed.
-func RestoreInNS(cfg Config, id string, image string, vmstatePath string, memPath string, ns *NetNS) (*VM, error) {
+// If useUffd is true, a UFFD handler pre-populates pages eagerly.
+func RestoreInNS(cfg Config, id string, image string, vmstatePath string, memPath string, ns *NetNS, useUffd ...bool) (*VM, error) {
 	socketDir := filepath.Join(cfg.WorkDir, id)
 	if err := os.MkdirAll(socketDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create socket dir: %w", err)
@@ -624,8 +630,14 @@ func RestoreInNS(cfg Config, id string, image string, vmstatePath string, memPat
 
 	waitForSocket(socketPath)
 
-	if err := vm.LoadSnapshot(vmstatePath, memPath); err != nil {
-		return nil, err
+	if len(useUffd) > 0 && useUffd[0] {
+		if err := vm.LoadSnapshotUffd(vmstatePath, memPath); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := vm.LoadSnapshot(vmstatePath, memPath); err != nil {
+			return nil, err
+		}
 	}
 	return vm, nil
 }
@@ -671,16 +683,65 @@ func PrepareRestore(cfg Config, id string, image string, net ...Network) (*VM, e
 // If the VM has a Network with a TAP name, network_overrides is used to
 // remap the snapshot's network device to the new TAP.
 func (vm *VM) LoadSnapshot(vmstatePath string, memPath string) error {
+	return vm.loadSnapshot(vmstatePath, memPath, false)
+}
+
+// LoadSnapshotUffd loads a snapshot using a UFFD page fault handler.
+// The handler pre-populates all pages eagerly, eliminating demand-paging latency.
+func (vm *VM) LoadSnapshotUffd(vmstatePath string, memPath string) error {
+	return vm.loadSnapshot(vmstatePath, memPath, true)
+}
+
+func (vm *VM) loadSnapshot(vmstatePath string, memPath string, useUffd bool) error {
 	start := time.Now()
-	loadReq := map[string]interface{}{
-		"snapshot_path": vmstatePath,
-		"mem_backend": map[string]interface{}{
-			"backend_type": "File",
-			"backend_path": memPath,
-		},
-		"enable_diff_snapshots": false,
-		"resume_vm":             true,
+
+	var loadReq map[string]interface{}
+
+	if useUffd {
+		// Start the UFFD handler process before loading the snapshot.
+		// Firecracker will connect to the UDS and send the UFFD fd.
+		uffdSock := filepath.Join(filepath.Dir(vm.SocketPath), "uffd.sock")
+		os.Remove(uffdSock)
+
+		handler := exec.Command("uffd-handler", uffdSock, memPath)
+		handler.Stderr = os.Stderr
+		if err := handler.Start(); err != nil {
+			return fmt.Errorf("start uffd-handler: %w", err)
+		}
+		vm.uffdHandler = handler
+
+		// Wait for handler to be ready (it creates uffd.sock.ready)
+		readyPath := uffdSock + ".ready"
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(readyPath); err == nil {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		os.Remove(readyPath)
+
+		loadReq = map[string]interface{}{
+			"snapshot_path": vmstatePath,
+			"mem_backend": map[string]interface{}{
+				"backend_type": "Uffd",
+				"backend_path": uffdSock,
+			},
+			"enable_diff_snapshots": false,
+			"resume_vm":             true,
+		}
+	} else {
+		loadReq = map[string]interface{}{
+			"snapshot_path": vmstatePath,
+			"mem_backend": map[string]interface{}{
+				"backend_type": "File",
+				"backend_path": memPath,
+			},
+			"enable_diff_snapshots": false,
+			"resume_vm":             true,
+		}
 	}
+
 	if vm.Net.TAPName != "" {
 		loadReq["network_overrides"] = []map[string]interface{}{
 			{"iface_id": "eth0", "host_dev_name": vm.Net.TAPName},
@@ -693,7 +754,7 @@ func (vm *VM) LoadSnapshot(vmstatePath string, memPath string) error {
 
 	vm.StartedAt = start
 	vm.PID = vm.cmd.Process.Pid
-	klog.Infof("vm %s restored in %v", vm.ID, time.Since(start))
+	klog.Infof("vm %s restored in %v (uffd=%v)", vm.ID, time.Since(start), useUffd)
 	return nil
 }
 
