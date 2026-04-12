@@ -81,6 +81,11 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 		return nil, false, fmt.Errorf("restore from baseline: %w", err)
 	}
 
+	// Background warmup: trigger guest kernel deferred work by connecting to
+	// the guest-agent. The guest needs ~500ms to stabilize after restore.
+	// This TCP connect forces the scheduler + TCP stack to warm up.
+	go v.Exec([]string{"/bin/true"}, 2*time.Second)
+
 	p.mu.Lock()
 	p.active[v.ID] = v
 	p.mu.Unlock()
