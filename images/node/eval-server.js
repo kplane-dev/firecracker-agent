@@ -28,13 +28,13 @@ const server = http.createServer((req, res) => {
       exitCode = 1;
     }
 
-    const body = JSON.stringify({ stdout, stderr, exit_code: exitCode });
+    const respBody = JSON.stringify({ stdout, stderr, exit_code: exitCode });
     res.writeHead(200, {
       'Content-Type': 'application/json',
       'Connection': 'close',
-      'Content-Length': Buffer.byteLength(body),
+      'Content-Length': Buffer.byteLength(respBody),
     });
-    res.end(body);
+    res.end(respBody);
   });
 });
 
