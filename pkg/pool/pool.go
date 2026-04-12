@@ -64,10 +64,8 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 	if vms := p.warm[image]; len(vms) > 0 {
 		v := vms[len(vms)-1]
 		p.warm[image] = vms[:len(vms)-1]
-		p.active[v.ID] = v
-		p.mu.Unlock()
-
 		remaining := len(p.warm[image])
+		p.active[v.ID] = v
 		p.mu.Unlock()
 
 		// Resume the paused VM (~1ms, no kernel warmup needed)

@@ -602,6 +602,7 @@ func RestoreInNS(cfg Config, id string, image string, vmstatePath string, memPat
 	}
 	socketPath := filepath.Join(socketDir, "fc.sock")
 	os.Remove(socketPath)
+	os.Remove(filepath.Join(socketDir, "vsock.sock")) // prevent "Address in use"
 
 	cmd, serialIn, serialOutReader, err := ns.StartFirecracker(cfg.FirecrackerBin, socketPath, socketDir)
 	if err != nil {
