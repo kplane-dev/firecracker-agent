@@ -103,21 +103,10 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 
 		p.applyResources(v, cpuMillis, memMiB)
 
-		// Warm V8/runtime immediately after resume so the user's first exec is fast.
-		// This runs the image's main binary once — the guest kernel caches the exec
-		// pattern, shared libs, and runtime state. Cost: ~130ms for node, but the
-		// user's first node -v drops from ~130ms to ~16ms.
-		switch image {
-		case "node":
-			v.Exec([]string{"node", "-e", "0"}, 5*time.Second)
-		case "python":
-			v.Exec([]string{"python3", "-c", ""}, 5*time.Second)
-		}
-
 		// Replenish in background (throttled to 1 concurrent)
 		go p.throttledReplenish(image)
 
-		klog.Infof("pool: claimed warm %s (image=%s, resume+warmup=%dms, %d warm remaining)",
+		klog.Infof("pool: claimed warm %s (image=%s, resume=%dms, %d warm remaining)",
 			v.ID, image, time.Since(start).Milliseconds(), remaining)
 		return v, true, nil
 	}
@@ -164,19 +153,10 @@ func (p *Pool) restoreAndWarm(id, image string, bl *baseline) (*vm.VM, error) {
 		return nil, fmt.Errorf("restore: %w", err)
 	}
 
-	// Warm the guest: kick serial, then run the image's main binary.
-	// UFFD pre-populates all host pages, and running node/python here
-	// warms the guest kernel's page cache + exec pattern. On claim,
-	// the first user exec benefits from both caches being hot.
+	// Warm the guest kernel — exercises scheduler, loads basic pages.
+	// The baseline already includes a warmed V8/runtime state from Fill().
 	v.SerialKick()
-	switch image {
-	case "node":
-		v.Exec([]string{"node", "-v"}, 5*time.Second)
-	case "python":
-		v.Exec([]string{"python3", "-V"}, 5*time.Second)
-	default:
-		v.Exec([]string{"/bin/true"}, 5*time.Second)
-	}
+	v.Exec([]string{"/bin/true"}, 5*time.Second)
 
 	return v, nil
 }
@@ -243,6 +223,17 @@ func (p *Pool) Fill() error {
 		}
 		if err := v.ConfigureGuestNetwork(net); err != nil {
 			klog.Warningf("pool: network config failed for %s: %v", v.ID, err)
+		}
+
+		// Run the image's main runtime before snapshotting so the baseline
+		// memory includes the warmed kernel exec pattern, dynamic linker
+		// cache, page cache, and V8/runtime state. Every restore from this
+		// baseline starts with these caches hot.
+		switch image {
+		case "node":
+			v.Exec([]string{"node", "-v"}, 10*time.Second)
+		case "python":
+			v.Exec([]string{"python3", "-V"}, 10*time.Second)
 		}
 
 		baselineDir := fmt.Sprintf("%s/baselines/%s", p.cfg.WorkDir, image)
