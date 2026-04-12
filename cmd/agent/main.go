@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -267,6 +268,48 @@ func main() {
 			"stderr":    stderr,
 			"exit_code": exitCode,
 		})
+	})
+
+	mux.HandleFunc("/exec-timing", func(w http.ResponseWriter, r *http.Request) {
+		vmID := r.URL.Query().Get("vm_id")
+		cmdStr := r.URL.Query().Get("cmd")
+		if vmID == "" || cmdStr == "" {
+			http.Error(w, "vm_id and cmd required", http.StatusBadRequest)
+			return
+		}
+		v := p.GetActive(vmID)
+		if v == nil {
+			http.Error(w, "VM not found", http.StatusNotFound)
+			return
+		}
+		if v.NS == nil {
+			http.Error(w, "VM has no namespace", http.StatusBadRequest)
+			return
+		}
+
+		reqJSON, _ := json.Marshal(struct {
+			Cmd []string `json:"cmd"`
+		}{Cmd: []string{"/bin/sh", "-c", cmdStr}})
+
+		cmd := exec.Command("nsexec", "-timing", v.NS.NSPath, "10.0.0.2:1024", string(reqJSON))
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+
+		result := map[string]interface{}{
+			"timing": stderr.String(),
+		}
+		if err != nil {
+			result["error"] = err.Error()
+		}
+		if len(out) > 0 {
+			var execResp map[string]interface{}
+			json.Unmarshal(out, &execResp)
+			result["exec"] = execResp
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
 	})
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

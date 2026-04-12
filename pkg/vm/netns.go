@@ -90,7 +90,13 @@ func ExecInNS(nsPath, guestAddr string, req interface{}, resp interface{}) error
 		return fmt.Errorf("marshal: %w", err)
 	}
 
-	out, err := exec.Command("nsexec", nsPath, guestAddr, string(reqJSON)).Output()
+	cmd := exec.Command("nsexec", "-timing", nsPath, guestAddr, string(reqJSON))
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if stderr.Len() > 0 {
+		klog.V(4).Infof("nsexec: %s", stderr.String())
+	}
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return fmt.Errorf("nsexec: %s", string(exitErr.Stderr))

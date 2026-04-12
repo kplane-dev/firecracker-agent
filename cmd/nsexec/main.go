@@ -1,9 +1,5 @@
 // nsexec enters a network namespace and sends a JSON command to a TCP endpoint.
-// Purpose-built helper to avoid Go runtime corruption from in-process setns
-// and overhead from shell+nc chains.
-//
-// Usage: nsexec <nsPath> <host:port> <json>
-// Example: nsexec /proc/123/ns/net 10.0.0.2:1024 '{"cmd":["/bin/sh","-c","node -v"]}'
+// With -timing flag, outputs per-step nanosecond breakdown to stderr.
 package main
 
 import (
@@ -16,53 +12,84 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 4 {
-		fmt.Fprintf(os.Stderr, "usage: nsexec <nsPath> <host:port> <json>\n")
+	timing := false
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "-timing" {
+		timing = true
+		args = args[1:]
+	}
+
+	if len(args) != 3 {
+		fmt.Fprintf(os.Stderr, "usage: nsexec [-timing] <nsPath> <host:port> <json>\n")
 		os.Exit(2)
 	}
 
-	nsPath := os.Args[1]
-	addr := os.Args[2]
-	payload := os.Args[3]
+	nsPath := args[0]
+	addr := args[1]
+	payload := args[2]
 
-	// Lock to current OS thread — setns applies to the thread
+	t0 := time.Now()
+
 	runtime.LockOSThread()
+	t1 := time.Now()
 
-	// Enter the target network namespace
+	// Open netns fd
 	nsFile, err := os.Open(nsPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open ns: %v\n", err)
 		os.Exit(1)
 	}
-	_, _, errno := syscall.RawSyscall(308, nsFile.Fd(), 0x40000000, 0) // SYS_SETNS, CLONE_NEWNET
+	t2 := time.Now()
+
+	// setns
+	_, _, errno := syscall.RawSyscall(308, nsFile.Fd(), 0x40000000, 0)
 	nsFile.Close()
 	if errno != 0 {
 		fmt.Fprintf(os.Stderr, "setns: %v\n", errno)
 		os.Exit(1)
 	}
+	t3 := time.Now()
 
-	// TCP connect to guest
+	// TCP connect
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "connect: %v\n", err)
 		os.Exit(1)
 	}
-	defer conn.Close()
+	t4 := time.Now()
+
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	// Send JSON + newline
+	// Write
 	conn.Write([]byte(payload))
 	conn.Write([]byte("\n"))
+	t5 := time.Now()
 
-	// Read full response to stdout (until EOF or timeout)
-	buf := make([]byte, 4096)
+	// Read response
+	buf := make([]byte, 65536)
+	total := 0
 	for {
-		n, err := conn.Read(buf)
+		n, err := conn.Read(buf[total:])
 		if n > 0 {
-			os.Stdout.Write(buf[:n])
+			total += n
 		}
 		if err != nil {
 			break
 		}
+	}
+	t6 := time.Now()
+
+	conn.Close()
+	os.Stdout.Write(buf[:total])
+
+	if timing {
+		fmt.Fprintf(os.Stderr, "nsexec timing:\n")
+		fmt.Fprintf(os.Stderr, "  lock_thread: %v\n", t1.Sub(t0))
+		fmt.Fprintf(os.Stderr, "  open_ns:     %v\n", t2.Sub(t1))
+		fmt.Fprintf(os.Stderr, "  setns:       %v\n", t3.Sub(t2))
+		fmt.Fprintf(os.Stderr, "  tcp_connect: %v\n", t4.Sub(t3))
+		fmt.Fprintf(os.Stderr, "  write:       %v\n", t5.Sub(t4))
+		fmt.Fprintf(os.Stderr, "  read:        %v\n", t6.Sub(t5))
+		fmt.Fprintf(os.Stderr, "  total:       %v\n", t6.Sub(t0))
 	}
 }
