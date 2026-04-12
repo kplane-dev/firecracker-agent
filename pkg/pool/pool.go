@@ -86,6 +86,9 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 	// This TCP connect forces the scheduler + TCP stack to warm up.
 	go v.Exec([]string{"/bin/true"}, 2*time.Second)
 
+	// Kick the guest kernel awake via serial to trigger deferred work
+	v.SerialKick()
+
 	p.mu.Lock()
 	p.active[v.ID] = v
 	p.mu.Unlock()

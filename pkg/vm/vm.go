@@ -525,6 +525,15 @@ func (vm *VM) Exec(cmd []string, timeout time.Duration) (stdout, stderr string, 
 	return vm.execVsock(cmd, timeout)
 }
 
+// SerialKick sends an empty line to the serial to wake the guest kernel.
+// This triggers deferred work (timer catch-up, interrupt handling) that
+// would otherwise add ~65ms to the first real exec after snapshot restore.
+func (vm *VM) SerialKick() {
+	if vm.serialIn != nil {
+		fmt.Fprintf(vm.serialIn, "\n")
+	}
+}
+
 // execSerial sends a command via the Firecracker serial console pipe.
 // The C serial-agent on the guest reads from ttyS0, runs the command,
 // and writes a JSON response. Zero runtime overhead after snapshot restore.
