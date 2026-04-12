@@ -153,10 +153,19 @@ func (p *Pool) restoreAndWarm(id, image string, bl *baseline) (*vm.VM, error) {
 		return nil, fmt.Errorf("restore: %w", err)
 	}
 
-	// Warm the guest kernel — exercises scheduler, loads basic pages.
-	// UFFD handler pre-populates all pages eagerly, so this is fast.
+	// Warm the guest: kick serial, then run the image's main binary.
+	// UFFD pre-populates all host pages, and running node/python here
+	// warms the guest kernel's page cache + exec pattern. On claim,
+	// the first user exec benefits from both caches being hot.
 	v.SerialKick()
-	v.Exec([]string{"/bin/true"}, 5*time.Second)
+	switch image {
+	case "node":
+		v.Exec([]string{"node", "-v"}, 5*time.Second)
+	case "python":
+		v.Exec([]string{"python3", "-V"}, 5*time.Second)
+	default:
+		v.Exec([]string{"/bin/true"}, 5*time.Second)
+	}
 
 	return v, nil
 }
