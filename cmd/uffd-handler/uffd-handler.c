@@ -3,11 +3,12 @@
  *
  * Receives a userfaultfd from Firecracker via UDS, then:
  *   1. mmaps the snapshot mem file with MAP_POPULATE (pre-warm)
- *   2. spawns a prefetch thread that eagerly UFFDIO_COPYs all pages
- *   3. handles on-demand faults for pages hit before prefetch arrives
+ *   2. enters the fault-handling event loop immediately
+ *   3. spawns a prefetch thread that eagerly installs remaining pages
  *
- * This eliminates demand-paging latency: the guest runs at full speed
- * because pages are already installed by the time it touches them.
+ * The main thread serves on-demand faults with zero delay. The prefetch
+ * thread races ahead installing pages the guest hasn't touched yet.
+ * By the time the guest runs node -v, most pages are already installed.
  *
  * Usage: uffd-handler <uds-path> <mem-file-path>
  *
@@ -17,8 +18,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
-#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,13 +29,13 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 #include <linux/userfaultfd.h>
 
 #define MAX_REGIONS 4
 #define MAX_JSON    8192
 
-/* Parsed memory region from Firecracker's handshake. */
 struct region {
     uint64_t base_addr;
     uint64_t size;
@@ -41,34 +43,29 @@ struct region {
     uint64_t page_size;
 };
 
-/* Shared state for the handler. */
 struct handler_state {
     int                uffd_fd;
-    void              *backing;        /* mmap'd snapshot mem file */
+    void              *backing;
     size_t             backing_size;
     struct region      regions[MAX_REGIONS];
     int                num_regions;
     uint64_t           total_pages;
+    /* Bitmap: 1 bit per page. Set when installed (on-demand or prefetch). */
+    atomic_char       *installed;
 };
 
-/*
- * Minimal JSON parser for the region array.
- * Firecracker sends: [{"base_host_virt_addr":N,"size":N,"offset":N,"page_size":N,...},...]
- */
 static int parse_regions(const char *json, int len, struct region *out, int max) {
     int count = 0;
     const char *p = json;
     const char *end = json + len;
 
     while (p < end && count < max) {
-        /* Find next object */
         const char *obj = memchr(p, '{', end - p);
         if (!obj) break;
 
         struct region r = {0};
-        r.page_size = 4096; /* default */
+        r.page_size = 4096;
 
-        /* Extract fields — simple substring search */
         const char *obj_end = memchr(obj, '}', end - obj);
         if (!obj_end) break;
 
@@ -79,9 +76,7 @@ static int parse_regions(const char *json, int len, struct region *out, int max)
             r.size = strtoull(strchr(f + 6, ':') + 1, NULL, 10);
         if ((f = strstr(obj, "\"offset\"")) && f < obj_end)
             r.offset = strtoull(strchr(f + 8, ':') + 1, NULL, 10);
-        /* page_size (bytes, not kib despite the old field name) */
         if ((f = strstr(obj, "\"page_size\"")) && f < obj_end) {
-            /* Make sure we match "page_size" not "page_size_kib" */
             const char *after = f + 11;
             if (*after == '"' || *after == ' ' || *after == ':')
                 r.page_size = strtoull(strchr(f + 11, ':') + 1, NULL, 10);
@@ -93,19 +88,40 @@ static int parse_regions(const char *json, int len, struct region *out, int max)
     return count;
 }
 
-/* Prefetch: eagerly install all pages. Called before VM is resumed,
- * so no on-demand faults race with this — we own the entire address space.
- * Signals completion by creating a .done marker file. */
-static void prefetch_all(struct handler_state *s, const char *uds_path) {
+static uint64_t page_global_index(struct handler_state *s, int region, uint64_t offset_in_region) {
+    uint64_t idx = 0;
+    for (int i = 0; i < region; i++)
+        idx += s->regions[i].size / s->regions[i].page_size;
+    idx += offset_in_region / s->regions[region].page_size;
+    return idx;
+}
+
+/* Returns 1 if already set. */
+static int mark_installed(struct handler_state *s, uint64_t idx) {
+    uint64_t byte = idx / 8;
+    char bit = 1 << (idx % 8);
+    char old = atomic_fetch_or(&s->installed[byte], bit);
+    return (old & bit) != 0;
+}
+
+/* Prefetch thread: install all pages that haven't been served on-demand. */
+static void *prefetch_thread(void *arg) {
+    struct handler_state *s = (struct handler_state *)arg;
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    uint64_t installed = 0;
+    uint64_t installed = 0, skipped = 0;
     for (int r = 0; r < s->num_regions; r++) {
         uint64_t psize = s->regions[r].page_size;
         uint64_t npages = s->regions[r].size / psize;
 
         for (uint64_t p = 0; p < npages; p++) {
+            uint64_t idx = page_global_index(s, r, p * psize);
+            if (mark_installed(s, idx)) {
+                skipped++;
+                continue;
+            }
+
             uint64_t dst = s->regions[r].base_addr + p * psize;
             void *src = (char *)s->backing + s->regions[r].offset + p * psize;
 
@@ -117,26 +133,16 @@ static void prefetch_all(struct handler_state *s, const char *uds_path) {
             };
             if (ioctl(s->uffd_fd, UFFDIO_COPY, &copy) != -1)
                 installed++;
-            /* EEXIST/EAGAIN: skip — not expected pre-resume */
         }
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
-    fprintf(stderr, "uffd-handler: prefetched %lu/%lu pages in %ldms\n",
-            (unsigned long)installed, (unsigned long)s->total_pages, ms);
-
-    /* Signal completion */
-    char done_path[256];
-    snprintf(done_path, sizeof(done_path), "%s.done", uds_path);
-    int fd = open(done_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    if (fd >= 0) close(fd);
+    fprintf(stderr, "uffd-handler: prefetched %lu pages, %lu on-demand, in %ldms\n",
+            (unsigned long)installed, (unsigned long)skipped, ms);
+    return NULL;
 }
 
-/*
- * Create UDS, listen, accept Firecracker's connection,
- * receive the UFFD fd + region mappings.
- */
 static int handshake(const char *uds_path, int *uffd_out, char *json_out, int *json_len) {
     int srv = socket(AF_UNIX, SOCK_STREAM, 0);
     if (srv < 0) return -1;
@@ -154,7 +160,6 @@ static int handshake(const char *uds_path, int *uffd_out, char *json_out, int *j
         return -1;
     }
 
-    /* Signal readiness by writing a marker file */
     char ready_path[256];
     snprintf(ready_path, sizeof(ready_path), "%s.ready", uds_path);
     int rfd = open(ready_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
@@ -164,7 +169,6 @@ static int handshake(const char *uds_path, int *uffd_out, char *json_out, int *j
     close(srv);
     if (stream < 0) return -1;
 
-    /* Receive the UFFD fd via SCM_RIGHTS + region JSON as data */
     struct msghdr msg = {0};
     struct iovec iov;
     char cmsg_buf[CMSG_SPACE(sizeof(int))];
@@ -198,24 +202,16 @@ int main(int argc, char **argv) {
     const char *uds_path = argv[1];
     const char *mem_path = argv[2];
 
-    /* mmap the snapshot mem file with MAP_POPULATE (pre-warm into page cache) */
     int mem_fd = open(mem_path, O_RDONLY);
-    if (mem_fd < 0) {
-        perror("open mem file");
-        return 1;
-    }
+    if (mem_fd < 0) { perror("open mem file"); return 1; }
     struct stat st;
     fstat(mem_fd, &st);
     size_t mem_size = st.st_size;
 
     void *backing = mmap(NULL, mem_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, mem_fd, 0);
     close(mem_fd);
-    if (backing == MAP_FAILED) {
-        perror("mmap mem file");
-        return 1;
-    }
+    if (backing == MAP_FAILED) { perror("mmap mem file"); return 1; }
 
-    /* Handshake with Firecracker */
     int uffd_fd;
     char json[MAX_JSON];
     int json_len;
@@ -225,7 +221,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Parse region mappings */
     struct handler_state state = {
         .uffd_fd      = uffd_fd,
         .backing      = backing,
@@ -237,21 +232,21 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Compute total pages */
     state.total_pages = 0;
     for (int i = 0; i < state.num_regions; i++)
         state.total_pages += state.regions[i].size / state.regions[i].page_size;
 
+    size_t bitmap_bytes = (state.total_pages + 7) / 8;
+    state.installed = calloc(bitmap_bytes, 1);
+
     fprintf(stderr, "uffd-handler: %d regions, %lu pages, mem=%zuMB\n",
             state.num_regions, (unsigned long)state.total_pages, mem_size / (1024*1024));
 
-    /* Pre-populate ALL pages before the VM is resumed.
-     * resume_vm=false in the snapshot load request, so no guest faults
-     * race with this — we install every page, then signal done,
-     * then Go code resumes the VM. Zero page faults at runtime. */
-    prefetch_all(&state, uds_path);
+    /* Start prefetch in background — main thread handles faults immediately. */
+    pthread_t prefetch;
+    pthread_create(&prefetch, NULL, prefetch_thread, &state);
 
-    /* Event loop: handle balloon REMOVE events and late page faults. */
+    /* Event loop: serve on-demand faults + balloon events. */
     struct pollfd pfd = {.fd = uffd_fd, .events = POLLIN};
 
     for (;;) {
@@ -260,9 +255,9 @@ int main(int argc, char **argv) {
             if (errno == EINTR) continue;
             break;
         }
-        if (ret == 0) continue; /* timeout — check if still needed */
+        if (ret == 0) continue;
         if (pfd.revents & (POLLERR | POLLHUP))
-            break; /* Firecracker exited */
+            break;
 
         struct uffd_msg msg;
         ssize_t n = read(uffd_fd, &msg, sizeof(msg));
@@ -274,7 +269,6 @@ int main(int argc, char **argv) {
         if (msg.event == UFFD_EVENT_PAGEFAULT) {
             uint64_t fault_addr = msg.arg.pagefault.address;
 
-            /* Find the region and serve the page */
             for (int r = 0; r < state.num_regions; r++) {
                 uint64_t base = state.regions[r].base_addr;
                 uint64_t rend = base + state.regions[r].size;
@@ -286,15 +280,18 @@ int main(int argc, char **argv) {
                 uint64_t dst = base + page_off;
                 void *src = (char *)backing + state.regions[r].offset + page_off;
 
+                /* Mark so prefetch skips it */
+                uint64_t idx = page_global_index(&state, r, page_off);
+                mark_installed(&state, idx);
+
                 struct uffdio_copy copy = {
                     .dst = dst, .src = (uint64_t)src,
-                    .len = psize, .mode = 0,
+                    .len = psize, .mode = 0, /* wake faulting thread */
                 };
                 ioctl(state.uffd_fd, UFFDIO_COPY, &copy);
                 break;
             }
         } else if (msg.event == UFFD_EVENT_REMOVE) {
-            /* Balloon inflated — unregister the range */
             struct uffdio_range range = {
                 .start = msg.arg.remove.start,
                 .len   = msg.arg.remove.end - msg.arg.remove.start,
@@ -303,8 +300,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Cleanup */
+    pthread_join(prefetch, NULL);
     munmap(backing, mem_size);
+    free(state.installed);
     close(uffd_fd);
 
     return 0;

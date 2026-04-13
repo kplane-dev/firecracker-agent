@@ -11,7 +11,7 @@ RUN CGO_ENABLED=0 go build -o /firecracker-agent ./cmd/agent && \
 FROM alpine:3.22 AS c-builder
 RUN apk add --no-cache gcc musl-dev linux-headers
 COPY cmd/uffd-handler/uffd-handler.c /tmp/
-RUN gcc -static -O2 -o /uffd-handler /tmp/uffd-handler.c
+RUN gcc -static -O2 -pthread -o /uffd-handler /tmp/uffd-handler.c
 
 FROM alpine:3.22
 RUN apk add --no-cache ca-certificates btrfs-progs coreutils
