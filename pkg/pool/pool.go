@@ -75,10 +75,8 @@ func New(cfg vm.Config, maxVMs int, warmImages []string, minWarm, warmVCPUs, war
 	}
 }
 
-// Claim restores a fresh VM from the baseline snapshot.
-// Each VM is a clean restore — full isolation, no reuse. The baseline
-// includes a warmed runtime (node -v was run before snapshot), so the
-// guest kernel's exec caches are hot from the first instruction.
+// Claim grabs a pre-warmed paused VM and resumes it (~1ms).
+// Falls back to restore-from-baseline if the warm pool is empty.
 func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) {
 	p.mu.Lock()
 
@@ -87,6 +85,31 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 		return nil, false, fmt.Errorf("max VMs reached (%d)", p.maxVMs)
 	}
 
+	// Try warm pool — pre-warmed, paused VMs
+	if vms := p.warm[image]; len(vms) > 0 {
+		v := vms[len(vms)-1]
+		p.warm[image] = vms[:len(vms)-1]
+		remaining := len(p.warm[image])
+		p.active[v.ID] = v
+		p.mu.Unlock()
+
+		start := time.Now()
+		if err := v.Resume(); err != nil {
+			klog.Errorf("pool: resume failed for %s: %v", v.ID, err)
+			v.Destroy()
+			return nil, false, fmt.Errorf("resume: %w", err)
+		}
+
+		p.applyResources(v, cpuMillis, memMiB)
+
+		go p.throttledReplenish(image)
+
+		klog.Infof("pool: claimed warm %s (image=%s, resume=%dms, %d warm remaining)",
+			v.ID, image, time.Since(start).Milliseconds(), remaining)
+		return v, true, nil
+	}
+
+	// Fall back to cold restore from baseline
 	bl, ok := p.baselines[image]
 	if !ok {
 		p.mu.Unlock()
@@ -96,7 +119,7 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 	p.mu.Unlock()
 
 	start := time.Now()
-	v, err := p.restoreFromBaseline(id, image, bl)
+	v, err := p.restoreAndWarm(id, image, bl)
 	if err != nil {
 		return nil, false, err
 	}
@@ -107,14 +130,13 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 
 	p.applyResources(v, cpuMillis, memMiB)
 
-	klog.Infof("pool: claimed %s (image=%s, restore=%dms)",
+	klog.Infof("pool: claimed cold %s (image=%s, restore=%dms)",
 		v.ID, image, time.Since(start).Milliseconds())
 	return v, false, nil
 }
 
-// restoreFromBaseline creates a fresh VM from the baseline snapshot.
-// The baseline already includes warmed runtime state (V8, page cache).
-func (p *Pool) restoreFromBaseline(id, image string, bl *baseline) (*vm.VM, error) {
+// restoreAndWarm creates a VM from baseline: restore → warmup → ready.
+func (p *Pool) restoreAndWarm(id, image string, bl *baseline) (*vm.VM, error) {
 	ns, err := vm.CreateNetNS()
 	if err != nil {
 		return nil, fmt.Errorf("netns: %w", err)
@@ -129,8 +151,8 @@ func (p *Pool) restoreFromBaseline(id, image string, bl *baseline) (*vm.VM, erro
 		return nil, fmt.Errorf("restore: %w", err)
 	}
 
-	// Quick serial kick to confirm guest is responsive after restore.
 	v.SerialKick()
+	v.Exec([]string{"/bin/true"}, 5*time.Second)
 
 	return v, nil
 }
@@ -167,7 +189,8 @@ func (p *Pool) Fill() error {
 		_, hasBaseline := p.baselines[image]
 		p.mu.Unlock()
 		if hasBaseline {
-			continue // baseline already exists, nothing to do
+			p.replenishWarm(image)
+			continue
 		}
 
 		start := time.Now()
@@ -274,11 +297,30 @@ func (p *Pool) replenishWarm(image string) {
 		return
 	}
 
-	// No-op: warm pool is no longer used. VMs are restored fresh on claim
-	// from the baseline, which preserves the kernel's exec caching better
-	// than pause/resume (proven via branching benchmarks).
-	_ = needed
-	_ = bl
+	for i := 0; i < needed; i++ {
+		p.mu.Lock()
+		id := p.nextVMID()
+		p.mu.Unlock()
+
+		start := time.Now()
+		v, err := p.restoreAndWarm(id, image, bl)
+		if err != nil {
+			klog.Errorf("pool: warm VM failed for %s: %v", image, err)
+			continue
+		}
+
+		if err := v.Pause(); err != nil {
+			klog.Errorf("pool: pause failed for %s: %v", v.ID, err)
+			v.Destroy()
+			continue
+		}
+
+		p.mu.Lock()
+		p.warm[image] = append(p.warm[image], v)
+		klog.Infof("pool: warm VM %s (image=%s) ready in %v (%d/%d warm)",
+			v.ID, image, time.Since(start), len(p.warm[image]), p.minWarm)
+		p.mu.Unlock()
+	}
 }
 
 // GetActive returns an active VM by ID, or nil if not found.
