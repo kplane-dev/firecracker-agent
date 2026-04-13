@@ -245,9 +245,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "uffd-handler: %d regions, %lu pages, mem=%zuMB\n",
             state.num_regions, (unsigned long)state.total_pages, mem_size / (1024*1024));
 
-    /* Start prefetch in background — main thread handles faults immediately. */
-    pthread_t prefetch;
-    pthread_create(&prefetch, NULL, prefetch_thread, &state);
+    /* On-demand only — no prefetch thread. Prefetching all 65K pages per VM
+     * would force 256MB RSS × 20 VMs = 5GB, exceeding node memory.
+     * On-demand faults are served from the shared page cache (RAM-speed). */
 
     /* Event loop: serve on-demand faults + balloon events. */
     struct pollfd pfd = {.fd = uffd_fd, .events = POLLIN};
@@ -308,7 +308,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    pthread_join(prefetch, NULL);
     munmap(backing, mem_size);
     free(state.installed);
     close(uffd_fd);
