@@ -928,6 +928,8 @@ func Branch(cfg Config, source *VM, count int, allocNet NetAllocFunc) ([]*VM, er
 }
 
 // branchFull is the fallback when no baseline exists (full snapshot).
+// Each branch gets its own network namespace (like the warm pool) to
+// avoid TAP device conflicts.
 func branchFull(cfg Config, source *VM, count int, allocNet NetAllocFunc) ([]*VM, error) {
 	snapBase := filepath.Join(cfg.WorkDir, "snap-ram")
 	if _, err := os.Stat(snapBase); err != nil {
@@ -967,9 +969,17 @@ func branchFull(cfg Config, source *VM, count int, allocNet NetAllocFunc) ([]*VM
 			branchVmstate := filepath.Join(branchDir, "vmstate")
 			ReflinkCopy(srcVmstate, branchVmstate)
 
-			restoreStart := time.Now()
-			vm, err := Restore(cfg, branchID, source.Image, branchVmstate, sharedMem)
+			// Each branch gets its own netns to avoid TAP conflicts
+			ns, err := CreateNetNS()
 			if err != nil {
+				ch <- result{idx: i, err: fmt.Errorf("branch %d netns: %w", i, err)}
+				return
+			}
+
+			restoreStart := time.Now()
+			vm, err := RestoreInNS(cfg, branchID, source.Image, branchVmstate, sharedMem, ns)
+			if err != nil {
+				ns.Destroy()
 				ch <- result{idx: i, err: err}
 				return
 			}
