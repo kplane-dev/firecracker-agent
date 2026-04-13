@@ -147,7 +147,7 @@ func (p *Pool) restoreAndWarm(id, image string, bl *baseline) (*vm.VM, error) {
 	vmstatePath := fmt.Sprintf("%s/vmstate", bl.vmstateDir)
 	memPath := fmt.Sprintf("%s/mem", bl.vmstateDir)
 
-	v, err := vm.RestoreInNS(p.cfg, id, image, vmstatePath, memPath, ns)
+	v, err := vm.RestoreInNS(p.cfg, id, image, vmstatePath, memPath, ns, true)
 	if err != nil {
 		ns.Destroy()
 		return nil, fmt.Errorf("restore: %w", err)

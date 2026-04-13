@@ -288,7 +288,12 @@ int main(int argc, char **argv) {
                     .dst = dst, .src = (uint64_t)src,
                     .len = psize, .mode = 0, /* wake faulting thread */
                 };
-                ioctl(state.uffd_fd, UFFDIO_COPY, &copy);
+                if (ioctl(state.uffd_fd, UFFDIO_COPY, &copy) == -1 && errno == EEXIST) {
+                    /* Prefetch installed this page with DONTWAKE — we must
+                     * explicitly wake the faulting thread. */
+                    struct uffdio_range wake = { .start = dst, .len = psize };
+                    ioctl(state.uffd_fd, UFFDIO_WAKE, &wake);
+                }
                 break;
             }
         } else if (msg.event == UFFD_EVENT_REMOVE) {
