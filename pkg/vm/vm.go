@@ -1126,7 +1126,7 @@ func newAPIClient(socketPath string) *http.Client {
 				return net.Dial("unix", socketPath)
 			},
 		},
-		Timeout: 30 * time.Second,
+		Timeout: 5 * time.Second,
 	}
 }
 
