@@ -728,7 +728,7 @@ func (vm *VM) loadSnapshot(vmstatePath string, memPath string, useUffd bool) err
 				"backend_path": uffdSock,
 			},
 			"enable_diff_snapshots": false,
-			"resume_vm":             false, // don't resume yet — wait for prefetch
+			"resume_vm":             true,
 		}
 	} else {
 		loadReq = map[string]interface{}{
@@ -752,26 +752,8 @@ func (vm *VM) loadSnapshot(vmstatePath string, memPath string, useUffd bool) err
 		return fmt.Errorf("load snapshot: %w", err)
 	}
 
-	// If using UFFD, wait for prefetch to complete, then resume the VM.
-	// All pages are pre-populated — the guest starts with zero page faults.
-	if useUffd {
-		uffdSock := filepath.Join(filepath.Dir(vm.SocketPath), "uffd.sock")
-		donePath := uffdSock + ".done"
-		deadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(deadline) {
-			if _, err := os.Stat(donePath); err == nil {
-				break
-			}
-			time.Sleep(1 * time.Millisecond)
-		}
-		os.Remove(donePath)
-
-		if err := vm.apiPatch("/vm", map[string]interface{}{"state": "Resumed"}); err != nil {
-			vm.Destroy()
-			return fmt.Errorf("resume after prefetch: %w", err)
-		}
-		klog.Infof("vm %s: prefetch complete, resumed", vm.ID)
-	}
+	// UFFD handler pre-populates pages in the background while the VM runs.
+	// The guest starts immediately; most pages are installed before it needs them.
 
 	vm.StartedAt = start
 	vm.PID = vm.cmd.Process.Pid
@@ -1144,7 +1126,7 @@ func newAPIClient(socketPath string) *http.Client {
 				return net.Dial("unix", socketPath)
 			},
 		},
-		Timeout: 5 * time.Second,
+		Timeout: 30 * time.Second,
 	}
 }
 
