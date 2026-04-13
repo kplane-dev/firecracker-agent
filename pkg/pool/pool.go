@@ -220,19 +220,13 @@ func (p *Pool) Fill() error {
 			klog.Warningf("pool: network config failed for %s: %v", v.ID, err)
 		}
 
-		// Run the runtime multiple times before snapshotting. The guest kernel
-		// caches the exec pattern, dynamic linker state, and page cache more
-		// aggressively with each run. Branches proved this state survives
-		// snapshot+restore — first node -v drops from 175ms to ~96ms.
+		// Run the image's main runtime before snapshotting so the baseline
+		// memory includes warmed page cache and runtime state.
 		switch image {
 		case "node":
-			for i := 0; i < 3; i++ {
-				v.Exec([]string{"node", "-v"}, 10*time.Second)
-			}
+			v.Exec([]string{"node", "-v"}, 10*time.Second)
 		case "python":
-			for i := 0; i < 3; i++ {
-				v.Exec([]string{"python3", "-V"}, 10*time.Second)
-			}
+			v.Exec([]string{"python3", "-V"}, 10*time.Second)
 		}
 
 		baselineDir := fmt.Sprintf("%s/baselines/%s", p.cfg.WorkDir, image)
