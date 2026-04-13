@@ -208,7 +208,10 @@ int main(int argc, char **argv) {
     fstat(mem_fd, &st);
     size_t mem_size = st.st_size;
 
-    void *backing = mmap(NULL, mem_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, mem_fd, 0);
+    /* MAP_PRIVATE without MAP_POPULATE — pages are read from the file's page cache
+     * on demand. Since the file is on tmpfs (snap-ram), reads are RAM-speed.
+     * MAP_POPULATE would allocate 256MB RSS per handler × 20 handlers = 5GB OOM. */
+    void *backing = mmap(NULL, mem_size, PROT_READ, MAP_PRIVATE, mem_fd, 0);
     close(mem_fd);
     if (backing == MAP_FAILED) { perror("mmap mem file"); return 1; }
 
