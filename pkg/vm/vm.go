@@ -82,8 +82,18 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int, net ...Net
 		cmd = exec.Command(cfg.FirecrackerBin, "--api-sock", socketPath)
 	}
 	cmd.Dir = socketDir
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
+
+	// Connect serial pipes so exec during baseline creation goes through
+	// the same serial→fork→exec path users will use after restore.
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdin pipe: %w", err)
+	}
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	cmd.Stderr = nil
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start firecracker: %w", err)
@@ -98,6 +108,8 @@ func Boot(cfg Config, id string, image string, vcpus int, memMiB int, net ...Net
 		Config:     cfg,
 		cmd:        cmd,
 		client:     newAPIClient(socketPath),
+		serialIn:   stdinPipe,
+		serialOut:  bufio.NewScanner(stdoutPipe),
 	}
 
 	waitForSocket(socketPath)
