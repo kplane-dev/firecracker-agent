@@ -75,8 +75,10 @@ func New(cfg vm.Config, maxVMs int, warmImages []string, minWarm, warmVCPUs, war
 	}
 }
 
-// Claim grabs a pre-warmed paused VM and resumes it (~1ms).
-// Falls back to restore-from-baseline if the warm pool is empty.
+// Claim restores a fresh VM from the baseline snapshot.
+// Each VM is a clean restore — full isolation, no reuse. The baseline
+// includes a warmed runtime (node -v was run before snapshot), so the
+// guest kernel's exec caches are hot from the first instruction.
 func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) {
 	p.mu.Lock()
 
@@ -85,33 +87,6 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 		return nil, false, fmt.Errorf("max VMs reached (%d)", p.maxVMs)
 	}
 
-	// Try warm pool — pre-warmed, paused VMs
-	if vms := p.warm[image]; len(vms) > 0 {
-		v := vms[len(vms)-1]
-		p.warm[image] = vms[:len(vms)-1]
-		remaining := len(p.warm[image])
-		p.active[v.ID] = v
-		p.mu.Unlock()
-
-		// Resume the paused VM (~1ms, no kernel warmup needed)
-		start := time.Now()
-		if err := v.Resume(); err != nil {
-			klog.Errorf("pool: resume failed for %s: %v", v.ID, err)
-			v.Destroy()
-			return nil, false, fmt.Errorf("resume: %w", err)
-		}
-
-		p.applyResources(v, cpuMillis, memMiB)
-
-		// Replenish in background (throttled to 1 concurrent)
-		go p.throttledReplenish(image)
-
-		klog.Infof("pool: claimed warm %s (image=%s, resume=%dms, %d warm remaining)",
-			v.ID, image, time.Since(start).Milliseconds(), remaining)
-		return v, true, nil
-	}
-
-	// Fall back to cold restore from baseline
 	bl, ok := p.baselines[image]
 	if !ok {
 		p.mu.Unlock()
@@ -121,7 +96,7 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 	p.mu.Unlock()
 
 	start := time.Now()
-	v, err := p.restoreAndWarm(id, image, bl)
+	v, err := p.restoreFromBaseline(id, image, bl)
 	if err != nil {
 		return nil, false, err
 	}
@@ -132,13 +107,14 @@ func (p *Pool) Claim(image string, cpuMillis, memMiB int) (*vm.VM, bool, error) 
 
 	p.applyResources(v, cpuMillis, memMiB)
 
-	klog.Infof("pool: claimed cold %s (image=%s, restore=%dms)",
+	klog.Infof("pool: claimed %s (image=%s, restore=%dms)",
 		v.ID, image, time.Since(start).Milliseconds())
 	return v, false, nil
 }
 
-// restoreAndWarm creates a VM from baseline: restore → warmup → ready.
-func (p *Pool) restoreAndWarm(id, image string, bl *baseline) (*vm.VM, error) {
+// restoreFromBaseline creates a fresh VM from the baseline snapshot.
+// The baseline already includes warmed runtime state (V8, page cache).
+func (p *Pool) restoreFromBaseline(id, image string, bl *baseline) (*vm.VM, error) {
 	ns, err := vm.CreateNetNS()
 	if err != nil {
 		return nil, fmt.Errorf("netns: %w", err)
@@ -153,10 +129,8 @@ func (p *Pool) restoreAndWarm(id, image string, bl *baseline) (*vm.VM, error) {
 		return nil, fmt.Errorf("restore: %w", err)
 	}
 
-	// Warm the guest kernel — exercises scheduler, loads basic pages.
-	// The baseline already includes a warmed V8/runtime state from Fill().
+	// Quick serial kick to confirm guest is responsive after restore.
 	v.SerialKick()
-	v.Exec([]string{"/bin/true"}, 5*time.Second)
 
 	return v, nil
 }
@@ -193,9 +167,7 @@ func (p *Pool) Fill() error {
 		_, hasBaseline := p.baselines[image]
 		p.mu.Unlock()
 		if hasBaseline {
-			// Replenish warm pool
-			p.replenishWarm(image)
-			continue
+			continue // baseline already exists, nothing to do
 		}
 
 		start := time.Now()
@@ -225,15 +197,19 @@ func (p *Pool) Fill() error {
 			klog.Warningf("pool: network config failed for %s: %v", v.ID, err)
 		}
 
-		// Run the image's main runtime before snapshotting so the baseline
-		// memory includes the warmed kernel exec pattern, dynamic linker
-		// cache, page cache, and V8/runtime state. Every restore from this
-		// baseline starts with these caches hot.
+		// Run the runtime multiple times before snapshotting. The guest kernel
+		// caches the exec pattern, dynamic linker state, and page cache more
+		// aggressively with each run. Branches proved this state survives
+		// snapshot+restore — first node -v drops from 175ms to ~96ms.
 		switch image {
 		case "node":
-			v.Exec([]string{"node", "-v"}, 10*time.Second)
+			for i := 0; i < 3; i++ {
+				v.Exec([]string{"node", "-v"}, 10*time.Second)
+			}
 		case "python":
-			v.Exec([]string{"python3", "-V"}, 10*time.Second)
+			for i := 0; i < 3; i++ {
+				v.Exec([]string{"python3", "-V"}, 10*time.Second)
+			}
 		}
 
 		baselineDir := fmt.Sprintf("%s/baselines/%s", p.cfg.WorkDir, image)
@@ -298,31 +274,11 @@ func (p *Pool) replenishWarm(image string) {
 		return
 	}
 
-	// Create warm VMs one at a time to avoid CPU contention
-	for i := 0; i < needed; i++ {
-		p.mu.Lock()
-		id := p.nextVMID()
-		p.mu.Unlock()
-
-		start := time.Now()
-		v, err := p.restoreAndWarm(id, image, bl)
-		if err != nil {
-			klog.Errorf("pool: warm VM failed for %s: %v", image, err)
-			continue
-		}
-
-		if err := v.Pause(); err != nil {
-			klog.Errorf("pool: pause failed for %s: %v", v.ID, err)
-			v.Destroy()
-			continue
-		}
-
-		p.mu.Lock()
-		p.warm[image] = append(p.warm[image], v)
-		klog.Infof("pool: warm VM %s (image=%s) ready in %v (%d/%d warm)",
-			v.ID, image, time.Since(start), len(p.warm[image]), p.minWarm)
-		p.mu.Unlock()
-	}
+	// No-op: warm pool is no longer used. VMs are restored fresh on claim
+	// from the baseline, which preserves the kernel's exec caching better
+	// than pause/resume (proven via branching benchmarks).
+	_ = needed
+	_ = bl
 }
 
 // GetActive returns an active VM by ID, or nil if not found.
