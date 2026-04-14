@@ -37,7 +37,7 @@ type Pool struct {
 	active        map[string]*vm.VM      // vmID -> running VM
 	nextID        int
 	nextNet       int
-	replenishing  int32                  // atomic: 1 if replenish is running
+	replenishing  sync.Map               // image -> int32 atomic (1 if replenish running)
 }
 
 // copyFileSync copies src to dst using O_SYNC to ensure data lands on the target filesystem.
@@ -277,12 +277,14 @@ func (p *Pool) Fill() error {
 	return nil
 }
 
-// throttledReplenish ensures only one replenish runs at a time.
+// throttledReplenish ensures only one replenish runs per image at a time.
 func (p *Pool) throttledReplenish(image string) {
-	if !atomic.CompareAndSwapInt32(&p.replenishing, 0, 1) {
-		return // already replenishing
+	v, _ := p.replenishing.LoadOrStore(image, new(int32))
+	flag := v.(*int32)
+	if !atomic.CompareAndSwapInt32(flag, 0, 1) {
+		return // already replenishing this image
 	}
-	defer atomic.StoreInt32(&p.replenishing, 0)
+	defer atomic.StoreInt32(flag, 0)
 	p.replenishWarm(image)
 }
 
