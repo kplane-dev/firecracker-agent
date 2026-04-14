@@ -284,9 +284,9 @@ func (p *Pool) Fill() error {
 }
 
 // maxConcurrentReplenish is the number of simultaneous restore+warm
-// goroutines allowed per image. Two lets us pipeline: one VM restoring
-// while another is running the runtime warmup exec.
-const maxConcurrentReplenish = 2
+// goroutines allowed per image. Four matches the vCPU count on n2-standard-4,
+// letting us pipeline restore+warmup across multiple VMs concurrently.
+const maxConcurrentReplenish = 4
 
 // throttledReplenish allows up to maxConcurrentReplenish concurrent
 // replenishments per image. Each goroutine calls replenishWarm which
