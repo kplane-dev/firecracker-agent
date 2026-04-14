@@ -283,14 +283,22 @@ func (p *Pool) Fill() error {
 	return nil
 }
 
-// throttledReplenish ensures only one replenish runs per image at a time.
+// maxConcurrentReplenish is the number of simultaneous restore+warm
+// goroutines allowed per image. Two lets us pipeline: one VM restoring
+// while another is running the runtime warmup exec.
+const maxConcurrentReplenish = 2
+
+// throttledReplenish allows up to maxConcurrentReplenish concurrent
+// replenishments per image. Each goroutine calls replenishWarm which
+// creates exactly as many VMs as capacity allows.
 func (p *Pool) throttledReplenish(image string) {
 	v, _ := p.replenishing.LoadOrStore(image, new(int32))
-	flag := v.(*int32)
-	if !atomic.CompareAndSwapInt32(flag, 0, 1) {
-		return // already replenishing this image
+	count := v.(*int32)
+	if atomic.AddInt32(count, 1) > maxConcurrentReplenish {
+		atomic.AddInt32(count, -1)
+		return
 	}
-	defer atomic.StoreInt32(flag, 0)
+	defer atomic.AddInt32(count, -1)
 	p.replenishWarm(image)
 }
 
