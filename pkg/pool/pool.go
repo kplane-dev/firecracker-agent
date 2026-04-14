@@ -187,7 +187,13 @@ func (p *Pool) Release(vmID string) error {
 		return fmt.Errorf("VM %s not found", vmID)
 	}
 	delete(p.active, vmID)
+	image := v.Image
 	p.mu.Unlock()
+
+	// Trigger replenishment now that capacity has freed up.
+	// Claim-triggered replenishment sees capacity=0 (active VM still counted)
+	// and does nothing. Release is the right trigger point.
+	go p.throttledReplenish(image)
 
 	return v.Destroy()
 }

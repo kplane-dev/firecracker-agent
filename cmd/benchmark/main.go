@@ -23,7 +23,7 @@ type result struct {
 	claimMs    int
 	exec1Ms    int
 	exec2Ms    int
-	totalMs    int
+	ttiMs      int // claim + exec1 — the user-visible TTI
 	fromWarm   bool
 }
 
@@ -89,6 +89,7 @@ func main() {
 		body, _ = io.ReadAll(resp.Body)
 		resp.Body.Close()
 		exec1Ms := int(time.Since(exec1Start).Milliseconds())
+		ttiMs := int(time.Since(totalStart).Milliseconds()) // claim + exec1
 
 		firstOutput := string(body)
 
@@ -104,8 +105,6 @@ func main() {
 		resp.Body.Close()
 		exec2Ms := int(time.Since(exec2Start).Milliseconds())
 
-		totalMs := int(time.Since(totalStart).Milliseconds())
-
 		// Release (not timed)
 		client.Get(fmt.Sprintf("%s/release?vm_id=%s", agentURL, claim.VMID))
 
@@ -115,7 +114,7 @@ func main() {
 				claimMs:  int(claim.ClaimTimeMs),
 				exec1Ms:  exec1Ms,
 				exec2Ms:  exec2Ms,
-				totalMs:  totalMs,
+				ttiMs:    ttiMs,
 				fromWarm: claim.FromWarm,
 			})
 		} else {
@@ -151,13 +150,13 @@ func main() {
 		)
 	}
 
-	var claimVals, exec1Vals, exec2Vals, totalVals []int
+	var claimVals, exec1Vals, exec2Vals, ttiVals []int
 	warmCount := 0
 	for _, r := range results {
 		claimVals = append(claimVals, r.claimMs)
 		exec1Vals = append(exec1Vals, r.exec1Ms)
 		exec2Vals = append(exec2Vals, r.exec2Ms)
-		totalVals = append(totalVals, r.totalMs)
+		ttiVals = append(ttiVals, r.ttiMs)
 		if r.fromWarm {
 			warmCount++
 		}
@@ -165,10 +164,11 @@ func main() {
 
 	fmt.Printf("Warm pool hits: %d/%d (%.0f%%)\n\n", warmCount, len(results), float64(warmCount)/float64(len(results))*100)
 
-	printStats("claim:", claimVals)
-	printStats("exec1 (cold):", exec1Vals)
-	printStats("exec2 (warm):", exec2Vals)
-	printStats("total (TTI):", totalVals)
+	printStats("TTI:", ttiVals)
+	fmt.Println()
+	printStats("  claim:", claimVals)
+	printStats("  exec1:", exec1Vals)
+	printStats("  exec2:", exec2Vals)
 
 	// Highlight the delta between exec1 and exec2
 	sort.Ints(exec1Vals)
