@@ -1,5 +1,11 @@
 // benchmark measures TTI: create sandbox → node -v → response.
 // Uses persistent HTTP connections (like a real SDK would).
+//
+// Measures:
+//   - claim_ms: server-side claim latency (from /claim response)
+//   - exec1_ms: first exec RTT (cold — first command after resume)
+//   - exec2_ms: second exec RTT on the same VM (warm — reveals page cache effects)
+//   - total_ms: claim + exec1 (the user-visible TTI)
 package main
 
 import (
@@ -12,6 +18,14 @@ import (
 	"strings"
 	"time"
 )
+
+type result struct {
+	claimMs    int
+	exec1Ms    int
+	exec2Ms    int
+	totalMs    int
+	fromWarm   bool
+}
 
 func main() {
 	var (
@@ -34,13 +48,13 @@ func main() {
 		},
 	}
 
-	var results []int
+	var results []result
 	success, fail := 0, 0
 
-	fmt.Printf("Sequential TTI: %d runs (%s → %s)\n\n", runs, image, cmd)
+	fmt.Printf("TTI breakdown: %d runs (%s → %s)\n\n", runs, image, cmd)
 
 	for i := 0; i < runs; i++ {
-		start := time.Now()
+		totalStart := time.Now()
 
 		// Claim
 		resp, err := client.Get(fmt.Sprintf("%s/claim?image=%s", agentURL, image))
@@ -52,7 +66,9 @@ func main() {
 		resp.Body.Close()
 
 		var claim struct {
-			VMID string `json:"vm_id"`
+			VMID        string `json:"vm_id"`
+			ClaimTimeMs int64  `json:"claim_time_ms"`
+			FromWarm    bool   `json:"from_warm_pool"`
 		}
 		json.Unmarshal(body, &claim)
 		if claim.VMID == "" {
@@ -60,8 +76,11 @@ func main() {
 			continue
 		}
 
-		// Exec
-		resp, err = client.Get(fmt.Sprintf("%s/exec?vm_id=%s&cmd=%s", agentURL, claim.VMID, strings.ReplaceAll(cmd, " ", "%20")))
+		cmdEncoded := strings.ReplaceAll(cmd, " ", "%20")
+
+		// First exec (cold — first command after resume)
+		exec1Start := time.Now()
+		resp, err = client.Get(fmt.Sprintf("%s/exec?vm_id=%s&cmd=%s", agentURL, claim.VMID, cmdEncoded))
 		if err != nil {
 			fail++
 			client.Get(fmt.Sprintf("%s/release?vm_id=%s", agentURL, claim.VMID))
@@ -69,19 +88,39 @@ func main() {
 		}
 		body, _ = io.ReadAll(resp.Body)
 		resp.Body.Close()
+		exec1Ms := int(time.Since(exec1Start).Milliseconds())
 
-		elapsed := time.Since(start)
+		firstOutput := string(body)
 
-		// Check success
-		if strings.Contains(string(body), "v22") || strings.Contains(string(body), "ok") {
-			success++
-			results = append(results, int(elapsed.Milliseconds()))
-		} else {
+		// Second exec (warm — same VM, immediately after)
+		exec2Start := time.Now()
+		resp, err = client.Get(fmt.Sprintf("%s/exec?vm_id=%s&cmd=%s", agentURL, claim.VMID, cmdEncoded))
+		if err != nil {
 			fail++
+			client.Get(fmt.Sprintf("%s/release?vm_id=%s", agentURL, claim.VMID))
+			continue
 		}
+		body, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		exec2Ms := int(time.Since(exec2Start).Milliseconds())
+
+		totalMs := int(time.Since(totalStart).Milliseconds())
 
 		// Release (not timed)
 		client.Get(fmt.Sprintf("%s/release?vm_id=%s", agentURL, claim.VMID))
+
+		if strings.Contains(firstOutput, "v22") || strings.Contains(firstOutput, "v20") || strings.Contains(firstOutput, "ok") {
+			success++
+			results = append(results, result{
+				claimMs:  int(claim.ClaimTimeMs),
+				exec1Ms:  exec1Ms,
+				exec2Ms:  exec2Ms,
+				totalMs:  totalMs,
+				fromWarm: claim.FromWarm,
+			})
+		} else {
+			fail++
+		}
 
 		if (i+1)%25 == 0 {
 			fmt.Printf("  [%d/%d] success=%d fail=%d\n", i+1, runs, success, fail)
@@ -93,17 +132,52 @@ func main() {
 		return
 	}
 
-	sort.Ints(results)
-	total := 0
-	for _, r := range results {
-		total += r
+	fmt.Printf("\nSuccess: %d/%d\n\n", success, success+fail)
+
+	printStats := func(label string, vals []int) {
+		sort.Ints(vals)
+		total := 0
+		for _, v := range vals {
+			total += v
+		}
+		fmt.Printf("%-12s  avg=%3dms  p50=%3dms  p95=%3dms  p99=%3dms  min=%3dms  max=%3dms\n",
+			label,
+			total/len(vals),
+			vals[len(vals)/2],
+			vals[len(vals)*95/100],
+			vals[len(vals)*99/100],
+			vals[0],
+			vals[len(vals)-1],
+		)
 	}
 
-	fmt.Printf("\nSuccess: %d/%d\n", success, success+fail)
-	fmt.Printf("Average: %dms\n", total/len(results))
-	fmt.Printf("Min:     %dms\n", results[0])
-	fmt.Printf("Median:  %dms\n", results[len(results)/2])
-	fmt.Printf("P95:     %dms\n", results[len(results)*95/100])
-	fmt.Printf("P99:     %dms\n", results[len(results)*99/100])
-	fmt.Printf("Max:     %dms\n", results[len(results)-1])
+	var claimVals, exec1Vals, exec2Vals, totalVals []int
+	warmCount := 0
+	for _, r := range results {
+		claimVals = append(claimVals, r.claimMs)
+		exec1Vals = append(exec1Vals, r.exec1Ms)
+		exec2Vals = append(exec2Vals, r.exec2Ms)
+		totalVals = append(totalVals, r.totalMs)
+		if r.fromWarm {
+			warmCount++
+		}
+	}
+
+	fmt.Printf("Warm pool hits: %d/%d (%.0f%%)\n\n", warmCount, len(results), float64(warmCount)/float64(len(results))*100)
+
+	printStats("claim:", claimVals)
+	printStats("exec1 (cold):", exec1Vals)
+	printStats("exec2 (warm):", exec2Vals)
+	printStats("total (TTI):", totalVals)
+
+	// Highlight the delta between exec1 and exec2
+	sort.Ints(exec1Vals)
+	sort.Ints(exec2Vals)
+	delta := exec1Vals[len(exec1Vals)/2] - exec2Vals[len(exec2Vals)/2]
+	fmt.Printf("\nexec1 p50 - exec2 p50 = %dms  (page cache / V8 effect)\n", delta)
+	if delta <= 5 {
+		fmt.Println("→ exec1 ≈ exec2: V8 startup is CPU-bound, not page cache")
+	} else {
+		fmt.Printf("→ exec1 > exec2 by %dms: first exec pays a warm-up cost\n", delta)
+	}
 }
